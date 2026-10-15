@@ -22,6 +22,16 @@ import requests
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+
+# Python 3.12 dropped distutils from the stdlib, and undetected_chromedriver
+# still imports distutils.version. Importing setuptools installs the meta-path
+# finder that re-exposes distutils, so this works even if the .pth hook missed.
+try:
+    import distutils  # noqa: F401
+except ModuleNotFoundError:
+    import setuptools  # noqa: F401
+    import distutils  # noqa: F401
+
 import undetected_chromedriver as uc
 from pyvirtualdisplay import Display
 
