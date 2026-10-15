@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Organic-traffic smoke test with gated ad clicks.
 
-Runs from GitHub Actions on a schedule. Routes every session through a free
-US/UK VPN (or an optional residential proxy), presents a consistent browser
-identity, behaves like a human visitor, and clicks an ad on a small number of
-runs per day.
+Runs from GitHub Actions on a schedule, or from an external pinger via
+workflow_dispatch. Routes every session through a free US/UK VPN (or an
+optional residential proxy), presents a consistent browser identity, behaves
+like a human visitor, and clicks an ad on a small number of runs per day.
 """
 
 import base64
@@ -1414,7 +1414,9 @@ scored.sort(key=lambda x: x[0], reverse=True)
 click_slots = {(h, s) for _, h, s in scored[:clicks_today]}
 
 event = os.environ.get("GITHUB_EVENT_NAME", "")
-should_click = True if event == "workflow_dispatch" else ((trigger.hour, trigger.minute // 5) in click_slots)
+force_click = os.environ.get("FORCE_CLICK", "").lower() == "true"
+# the slot gate always applies; manual runs only override it when explicitly forced
+should_click = force_click or ((trigger.hour, trigger.minute // 5) in click_slots)
 
 local_hour_now = trigger.astimezone(ZoneInfo(AUDIENCE_TZ)).hour
 hour_weight = DAY_WEIGHTS[local_hour_now]
@@ -1424,7 +1426,7 @@ views_this_run = max(1, min(MAX_SESSIONS_PER_RUN,
 print(f"[*] trigger={trigger.isoformat()} local_hour={local_hour_now} weight={hour_weight}")
 print(f"[*] month_idx={month_idx} growth={growth:.3f} dow={dow}")
 print(f"[*] today: clicks={clicks_today} views_base={views_base_today:.2f} "
-      f"views_this_run={views_this_run} click_run={should_click}")
+      f"views_this_run={views_this_run} click_run={should_click} force={force_click}")
 
 if event == "schedule":
     jitter = random.uniform(0, 90)
@@ -1450,6 +1452,7 @@ try:
     for si in range(n_sessions):
         proxy, label, cc, cleanup = establish_route()
         if not label:
+            print("[!] No route — ending run early")
             break
 
         identity = (random.randint(1, IDENTITY_COUNT)
@@ -1560,7 +1563,8 @@ try:
             f"clicks_planned_today={clicks_today}\n"
             f"views_base_today={views_base_today:.2f}\n"
             f"page_views={views}\nad_clicks={clicks}\n"
-            f"click_run={should_click}\nsessions={n_sessions}\n"
+            f"click_run={should_click}\nforce_click={force_click}\n"
+            f"sessions={n_sessions}\n"
             f"adblocked_sessions={adblocked_sessions}\n"
             f"pages_with_ads={ads_seen}\npages_without_ads={no_ad_pages}\n"
             f"session_click_rate_pct={ctr:.1f}\n"
