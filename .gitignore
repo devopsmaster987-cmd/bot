@@ -1,0 +1,41 @@
+
+# Generated monitoring output
+reports/
+*.log
+summary.json
+
+# Playwright
+test-results/
+playwright-report/
+playwright/.cache/
+screenshots/
+traces/
+*.trace.zip
+
+# Local configuration and secrets - never commit these
+.env
+.env.*
+config.local.json
+browser_tests.local.json
+secrets.json
+test-credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.Python
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

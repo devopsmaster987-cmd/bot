@@ -1,0 +1,230 @@
+
+{
+  "_comment": [
+    "Playwright UI tests for learning and testing your own website.",
+    "Every test must have approved=true and real selectors.",
+    "Replace SELECTOR_TODO placeholders with selectors from your actual pages.",
+    "Tests containing placeholder selectors remain disabled.",
+    "Form tests must use a staging environment and disposable test credentials.",
+    "Do not automate advertisement clicks or artificial ad traffic."
+  ],
+  "approved_hosts": [
+    "abdulsamad.shop",
+    "www.abdulsamad.shop",
+    "staging.abdulsamad.shop",
+    "test.abdulsamad.shop",
+    "localhost",
+    "127.0.0.1"
+  ],
+  "tests": [
+    {
+      "name": "homepage-loads",
+      "enabled": true,
+      "approved": true,
+      "requires_test_env": false,
+      "description": "Check that the homepage renders and scrolls.",
+      "url": "/",
+      "timeout_seconds": 90,
+      "steps": [
+        {
+          "action": "assert_visible",
+          "selector": "body",
+          "name": "body-rendered"
+        },
+        {
+          "action": "scroll",
+          "name": "full-page-scroll"
+        },
+        {
+          "action": "assert_no_console_errors",
+          "name": "clean-console"
+        }
+      ]
+    },
+    {
+      "name": "navigation-links",
+      "enabled": false,
+      "approved": true,
+      "requires_test_env": false,
+      "description": "Learning example: click a normal navigation link and check the destination.",
+      "url": "/",
+      "timeout_seconds": 120,
+      "steps": [
+        {
+          "action": "assert_visible",
+          "selector": "header",
+          "name": "header-present"
+        },
+        {
+          "action": "click",
+          "selector": "SELECTOR_TODO_header_nav_link",
+          "name": "click-navigation-link",
+          "after_click_wait_ms": 1500
+        },
+        {
+          "action": "assert_visible",
+          "selector": "main",
+          "name": "destination-page-rendered"
+        },
+        {
+          "action": "scroll",
+          "name": "scroll-destination"
+        }
+      ]
+    },
+    {
+      "name": "ordinary-ui-button-click",
+      "enabled": false,
+      "approved": true,
+      "requires_test_env": false,
+      "description": "Learning example: click an ordinary website button and verify its expected result. Never use an advertisement as the target.",
+      "url": "/",
+      "timeout_seconds": 90,
+      "steps": [
+        {
+          "action": "assert_visible",
+          "selector": "SELECTOR_TODO_button",
+          "name": "button-visible"
+        },
+        {
+          "action": "click",
+          "selector": "SELECTOR_TODO_button",
+          "name": "click-ordinary-button",
+          "after_click_wait_ms": 1000
+        },
+        {
+          "action": "assert_visible",
+          "selector": "SELECTOR_TODO_expected_result",
+          "name": "verify-button-result"
+        }
+      ]
+    },
+    {
+      "name": "accordion-or-tab",
+      "enabled": false,
+      "approved": true,
+      "requires_test_env": false,
+      "description": "Click a real accordion or tab and verify the panel appears.",
+      "url": "/",
+      "timeout_seconds": 90,
+      "steps": [
+        {
+          "action": "click",
+          "selector": "SELECTOR_TODO_accordion_trigger",
+          "name": "open-panel",
+          "after_click_wait_ms": 800
+        },
+        {
+          "action": "assert_visible",
+          "selector": "SELECTOR_TODO_accordion_panel",
+          "name": "panel-opened"
+        }
+      ]
+    },
+    {
+      "name": "newsletter-signup-test-env",
+      "enabled": false,
+      "approved": true,
+      "requires_test_env": true,
+      "description": "Test newsletter signup using a disposable address on staging.",
+      "url": "https://staging.abdulsamad.shop/",
+      "timeout_seconds": 120,
+      "wait_for_selector": "footer",
+      "steps": [
+        {
+          "action": "scroll_to",
+          "selector": "footer",
+          "name": "scroll-to-footer"
+        },
+        {
+          "action": "assert_visible",
+          "selector": "SELECTOR_TODO_newsletter_input",
+          "name": "newsletter-field-visible"
+        },
+        {
+          "action": "fill",
+          "selector": "SELECTOR_TODO_newsletter_input",
+          "name": "fill-test-email",
+          "value": "${TEST_USER_EMAIL}"
+        },
+        {
+          "action": "click",
+          "selector": "SELECTOR_TODO_newsletter_submit",
+          "name": "submit-signup",
+          "after_click_wait_ms": 2000
+        },
+        {
+          "action": "assert_text",
+          "selector": "SELECTOR_TODO_newsletter_result",
+          "text": "SELECTOR_TODO_expected_success_text",
+          "timeout_ms": 15000,
+          "name": "verify-confirmation"
+        },
+        {
+          "action": "screenshot",
+          "name": "newsletter-result"
+        }
+      ],
+      "form_data_note": "Set TEST_USER_EMAIL to a disposable test address in your test environment."
+    },
+    {
+      "name": "contact-form-validation",
+      "enabled": false,
+      "approved": true,
+      "requires_test_env": true,
+      "description": "Check invalid email validation on staging. Do not send a real message.",
+      "url": "https://staging.abdulsamad.shop/",
+      "timeout_seconds": 120,
+      "steps": [
+        {
+          "action": "scroll_to",
+          "selector": "form",
+          "name": "scroll-to-form"
+        },
+        {
+          "action": "fill",
+          "selector": "SELECTOR_TODO_contact_name",
+          "name": "fill-name",
+          "value": "qa-bot"
+        },
+        {
+          "action": "fill",
+          "selector": "SELECTOR_TODO_contact_email",
+          "name": "fill-invalid-email",
+          "value": "not-an-email"
+        },
+        {
+          "action": "fill",
+          "selector": "SELECTOR_TODO_contact_message",
+          "name": "fill-message",
+          "value": "Automated validation check."
+        },
+        {
+          "action": "assert_visible",
+          "selector": "SELECTOR_TODO_contact_error",
+          "name": "verify-validation-error"
+        }
+      ]
+    },
+    {
+      "name": "404-page",
+      "enabled": true,
+      "approved": true,
+      "requires_test_env": false,
+      "description": "Check the missing-page route.",
+      "url": "/__monitoring_404_probe__",
+      "timeout_seconds": 60,
+      "steps": [
+        {
+          "action": "assert_visible",
+          "selector": "body",
+          "name": "404-body-rendered"
+        },
+        {
+          "action": "scroll",
+          "name": "scroll-404"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,129 @@
+
+{
+  "_comment": [
+    "Main configuration for monitor.py and browser_tests.py.",
+    "GitHub Actions may override site.base_url with TARGET_URL.",
+    "browser.tests_file points to browser_tests.json.",
+    "Use only for websites you own or are authorized to test."
+  ],
+  "site": {
+    "base_url": "https://abdulsamad.shop",
+    "user_agent": "abdulsamad-shop-monitor/1.0 (+uptime monitoring; contact: site owner)",
+    "accept_language": "en-US,en;q=0.9"
+  },
+  "defaults": {
+    "method": "GET",
+    "timeout_seconds": 20,
+    "retries": 1,
+    "retry_delay_seconds": 2,
+    "expected_status": [200, 204, 301, 302, 307, 308],
+    "max_response_ms": 8000
+  },
+  "run": {
+    "_comment": "Timing settings for monitoring checks.",
+    "startup_jitter_seconds": 45,
+    "check_randomization": 0.75,
+    "between_checks_delay_seconds": [1, 4],
+    "max_redirects": 10
+  },
+  "network": {
+    "_comment": [
+      "Optional multi-origin checks for authorized website QA.",
+      "Automation must identify itself honestly.",
+      "Do not use proxies to disguise identity or evade rate limits.",
+      "Keep proxy credentials in config.local.json or environment secrets."
+    ],
+    "proxies": [],
+    "always_include_direct": true,
+    "proxy_failures_are_critical": false,
+    "proxy_allowed_hosts": [
+      "abdulsamad.shop",
+      "www.abdulsamad.shop",
+      "staging.abdulsamad.shop",
+      "test.abdulsamad.shop"
+    ]
+  },
+  "scheduler": {
+    "_comment": "Used by scheduler.py on a VPS.",
+    "min_interval_seconds": 120,
+    "max_interval_seconds": 300
+  },
+  "checks": [
+    {
+      "name": "homepage",
+      "url": "/",
+      "max_response_ms": 4000,
+      "expect_body_contains": "<html"
+    },
+    {
+      "name": "homepage-head",
+      "url": "/",
+      "method": "HEAD",
+      "max_response_ms": 3000
+    },
+    {
+      "name": "robots-txt",
+      "url": "/robots.txt",
+      "max_response_ms": 3000,
+      "expected_status": [200, 301, 302, 404],
+      "retries": 0
+    },
+    {
+      "name": "sitemap",
+      "url": "/sitemap.xml",
+      "max_response_ms": 5000,
+      "expected_status": [200, 301, 302, 404],
+      "retries": 0
+    },
+    {
+      "name": "favicon",
+      "url": "/favicon.ico",
+      "max_response_ms": 3000,
+      "expected_status": [200, 301, 302, 404],
+      "retries": 0
+    },
+    {
+      "name": "https-upgrade",
+      "url": "http://abdulsamad.shop/",
+      "max_response_ms": 8000,
+      "expected_status": [200, 301, 302, 307, 308],
+      "retries": 0
+    }
+  ],
+  "browser": {
+    "tests_file": "browser_tests.json",
+    "default_timeout_seconds": 90,
+    "navigation_timeout_ms": 30000,
+    "_approved_hosts_comment": [
+      "Tests targeting hosts outside allowed_test_hosts should fail validation.",
+      "Use staging for tests that submit forms or change data.",
+      "Use production only for non-submitting smoke tests."
+    ],
+    "allowed_test_hosts": [
+      "abdulsamad.shop",
+      "www.abdulsamad.shop",
+      "staging.abdulsamad.shop",
+      "test.abdulsamad.shop",
+      "localhost",
+      "127.0.0.1"
+    ],
+    "_user_agent_comment": "Identifies browser automation honestly.",
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 abdulsamad-shop-ci-bot/1.0",
+    "locale": "en-US",
+    "timezone_id": "UTC",
+    "ignore_https_errors": false,
+    "_scroll_comment": "Randomized scrolling tests lazy-loaded content; it is not for detection evasion.",
+    "scroll_min_seconds": 5,
+    "scroll_max_seconds": 20,
+    "_clicking_comment": [
+      "browser_tests.json can define ordinary UI clicks for learning and functional QA.",
+      "Use actual selectors and verify the expected result after each click.",
+      "Do not automate advertisement clicks or artificial ad engagement."
+    ],
+    "allow_ui_click_tests": true,
+    "launch_args": [
+      "--disable-dev-shm-usage",
+      "--no-sandbox"
+    ]
+  }
+}
