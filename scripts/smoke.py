@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Organic-traffic smoke test with gated ad clicks.
 
-Runs from GitHub Actions on a schedule, or from an external pinger via
-workflow_dispatch. Routes every session through a free US/UK VPN (or an
-optional residential proxy), presents a consistent browser identity, behaves
-like a human visitor, and clicks an ad on a small number of runs per day.
+Routes every session through, in order of preference: a residential proxy,
+a free US/UK VPN, a free US/GB proxy, or the runner's own IP. Presents a
+consistent browser identity, behaves like a human visitor, and clicks an ad
+on a small number of runs per day.
 """
 
 import base64
@@ -47,10 +47,11 @@ MIN_DWELL_MOBILE = (20, 95)
 MIN_GAP, MAX_GAP = 10, 30
 
 CLICKS_PER_DAY = 45
-VPN_COUNTRIES = ("US", "GB")
-MAX_VPN_ATTEMPTS = 3
-VPN_CONNECT_TIMEOUT = 30
+VPN_COUNTRIES = ("US", "GB", "UK")
+MAX_VPN_ATTEMPTS = 4
+VPN_CONNECT_TIMEOUT = 45
 VPN_SHORTLIST = 60
+ALLOW_DIRECT = True
 
 MOBILE_PROBABILITY = 0.45
 PERSIST_PROBABILITY = 0.60
@@ -76,6 +77,8 @@ ADBLOCK_URLS = [
     "*googleadservices.com*",
     "*adservice.google.com*",
 ]
+
+VPN_STATE = {"healthy": True}
 
 # ═══════════════════════════ BROWSER DETECTION ═══════════════════════════
 def _version_of(cmd):
@@ -119,6 +122,11 @@ if EDGE_BIN and EDGE_MAJOR != CHROME_MAJOR:
     EDGE_BIN = None
 elif EDGE_BIN:
     print(f"[*] Real Edge available {EDGE_FULL}")
+
+# environment sanity
+_ovpn = subprocess.run("which openvpn", shell=True, capture_output=True).stdout.decode().strip()
+print(f"[*] openvpn binary: {_ovpn or 'MISSING'}")
+print(f"[*] /dev/net/tun: {'present' if os.path.exists('/dev/net/tun') else 'MISSING'}")
 
 
 def brands_for(edge=False):
@@ -236,6 +244,7 @@ COUNTRY_PROFILES = {
                 "America/Los_Angeles", "America/Phoenix"],
     },
     "GB": {"locales": ["en-GB"], "tzs": ["Europe/London"]},
+    "UK": {"locales": ["en-GB"], "tzs": ["Europe/London"]},
 }
 
 OS_CHROME = {
@@ -436,17 +445,20 @@ print(f"[*] Residential proxy: {'set' if RESIDENTIAL_PROXY else 'not set (VPN on
 
 
 def fetch_vpngate(countries=VPN_COUNTRIES):
-    seen, servers = set(), []
+    seen, servers, codes = set(), [], {}
+    total = 0
     try:
-        r = requests.get("https://www.vpngate.net/api/iphone/", timeout=25)
+        r = requests.get("https://www.vpngate.net/api/iphone/", timeout=40)
         for line in r.text.splitlines():
             line = line.strip()
             if not line or line[0] in "*#":
                 continue
             p = line.split(",")
-            if len(p) < 15 or p[0] == "HostName" or p[6] not in countries:
+            if len(p) < 15 or p[0] == "HostName":
                 continue
-            if p[1] in seen:
+            total += 1
+            codes[p[6]] = codes.get(p[6], 0) + 1
+            if p[1] in seen or p[6] not in countries:
                 continue
             seen.add(p[1])
             servers.append({
@@ -457,10 +469,13 @@ def fetch_vpngate(countries=VPN_COUNTRIES):
             })
     except Exception as e:
         print(f"[!] VPN Gate fetch failed: {e}")
+
+    top = sorted(codes.items(), key=lambda kv: kv[1], reverse=True)[:8]
+    print(f"[+] VPN Gate parsed {total} rows; top countries: {top}")
     servers.sort(key=lambda s: s["score"], reverse=True)
     short = servers[:VPN_SHORTLIST]
     random.shuffle(short)
-    print(f"[+] VPN Gate: {len(servers)} unique US/GB servers, {len(short)} shortlisted")
+    print(f"[+] VPN Gate: {len(servers)} unique US/GB/UK servers, {len(short)} shortlisted")
     return short
 
 
@@ -469,27 +484,42 @@ def vpn_disconnect():
     time.sleep(1.5)
 
 
-def vpn_connect(server, timeout=VPN_CONNECT_TIMEOUT):
+def vpn_connect(server, timeout=VPN_CONNECT_TIMEOUT, force_tcp=False):
     cfg, auth, logf = "/tmp/vpg.ovpn", "/tmp/vpg.auth", "/tmp/vpg.log"
     try:
         data = base64.b64decode(server["config"]).decode("utf-8", "ignore")
-    except Exception:
+    except Exception as e:
+        print(f"[!] config decode failed: {e}")
         return None, None
 
+    # drop directives we override on the command line
+    kept = []
+    for ln in data.splitlines():
+        s = ln.strip().lower()
+        if (s.startswith("auth-user-pass") or s.startswith("data-ciphers")
+                or s.startswith("cipher ") or s.startswith("verb ")
+                or s.startswith("proto ") or s.startswith("comp-lzo")):
+            continue
+        kept.append(ln)
+
     with open(cfg, "w") as f:
-        f.write(data)
-        f.write(
-            "\n\n# compat for OpenVPN 2.6+\n"
-            "data-ciphers AES-128-CBC:AES-256-GCM:AES-128-GCM\n"
-            "data-ciphers-fallback AES-128-CBC\n"
-            "auth-nocache\nverb 3\n"
-        )
+        f.write("\n".join(kept))
+        f.write("\n\n# injected by smoke.py\n")
+        f.write("proto tcp-client\n" if force_tcp else "proto udp\n")
+        f.write("data-ciphers AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305\n")
+        f.write("data-ciphers-fallback AES-128-CBC\n")
+        f.write("allow-compression yes\n")
+        f.write("auth-nocache\n")
+        f.write("redirect-gateway def1\n")
+        f.write("ping 10\nping-restart 60\n")
+        f.write("verb 4\n")
+
     with open(auth, "w") as f:
         f.write("vpn\nvpn\n")
 
     vpn_disconnect()
     subprocess.run(
-        f"sudo openvpn --config {cfg} --auth-user-pass {auth} "
+        f"sudo openvpn --config {cfg} --auth-user-pass {auth} --cd /tmp "
         f"--daemon --log {logf} --writepid /tmp/vpg.pid",
         shell=True, check=False,
     )
@@ -502,30 +532,108 @@ def vpn_connect(server, timeout=VPN_CONNECT_TIMEOUT):
             if cc in VPN_COUNTRIES:
                 return ip, cc
         time.sleep(2)
+
+    try:
+        with open(logf) as f:
+            tail = f.read().strip().splitlines()[-10:]
+        print("[!] openvpn log tail:")
+        for l in tail:
+            print(f"    {l}")
+    except Exception:
+        pass
+
     vpn_disconnect()
     return None, None
 
 
+def fetch_country_proxies():
+    out = []
+    for u in [
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=us,gb",
+        "https://www.proxy-list.download/api/v1/get?type=http&country=US",
+        "https://www.proxy-list.download/api/v1/get?type=http&country=GB",
+    ]:
+        try:
+            for line in requests.get(u, timeout=15).text.splitlines():
+                line = line.strip()
+                if ":" in line and " " not in line:
+                    out.append(line)
+        except Exception:
+            pass
+    random.shuffle(out)
+    print(f"[+] Fallback proxy candidates: {len(out)}")
+    return out
+
+
+def validate_proxy(proxy, timeout=8):
+    try:
+        r = requests.get(
+            "https://httpbin.org/ip",
+            proxies={"http": f"http://{proxy}", "https": f"http://{proxy}"},
+            timeout=timeout,
+        )
+        if r.status_code == 200:
+            ip = r.json().get("origin", "").split(",")[0].strip()
+            return True, ip, ip_country(ip)
+    except Exception:
+        pass
+    return False, None, None
+
+
+class ProxyPool:
+    def __init__(self, proxies):
+        self.stack = proxies[:]
+        random.shuffle(self.stack)
+
+    def next(self):
+        while self.stack:
+            p = self.stack.pop()
+            ok, ip, cc = validate_proxy(p)
+            if ok:
+                print(f"[+] Proxy OK: {p} -> {ip} ({cc})")
+                return p, ip, cc or "US"
+        return None, None, None
+
+
 def establish_route():
+    # 1 — paid residential proxy
     if RESIDENTIAL_PROXY and random.random() < RESIDENTIAL_SHARE:
         ip = proxy_exit_ip(RESIDENTIAL_PROXY)
         if ip:
             cc = ip_country(ip)
             print(f"[+] Residential proxy exit {ip} ({cc})")
             return RESIDENTIAL_PROXY, f"RES:{ip}", cc or "US", (lambda: None)
-        print("[!] Residential proxy unreachable, falling back to VPN")
+        print("[!] Residential proxy unreachable, falling back")
 
-    for attempt in range(MAX_VPN_ATTEMPTS):
+    # 2 — free VPN (one attempt only once we know it is unhealthy)
+    attempts = MAX_VPN_ATTEMPTS if VPN_STATE["healthy"] else 1
+    for attempt in range(attempts):
         if not vpn_servers:
             break
         srv = random.choice(vpn_servers)
-        print(f"[*] VPN attempt {attempt + 1}/{MAX_VPN_ATTEMPTS} -> {srv['country']} {srv['ip']}")
-        ip, cc = vpn_connect(srv)
+        force_tcp = (attempt % 2 == 1)
+        print(f"[*] VPN attempt {attempt + 1}/{attempts} -> {srv['country']} {srv['ip']}"
+              f"{' (tcp)' if force_tcp else ' (udp)'}")
+        ip, cc = vpn_connect(srv, force_tcp=force_tcp)
         if ip:
+            VPN_STATE["healthy"] = True
             print(f"[+] Tunnel up {cc} {ip}")
             return None, f"VPN-{cc}:{ip}", cc, vpn_disconnect
 
-    print("[!] No route available")
+    VPN_STATE["healthy"] = False
+    print("[!] VPN unavailable")
+
+    # 3 — free US/GB proxy
+    p, ip, cc = proxy_pool.next()
+    if p:
+        print(f"[+] Using fallback proxy {ip} ({cc})")
+        return p, f"PROXY:{ip}", cc or "US", (lambda: None)
+
+    # 4 — runner's own IP as a last resort
+    if ALLOW_DIRECT:
+        print(f"[!] Using direct runner IP {ORIGIN_IP}")
+        return None, f"DIRECT:{ORIGIN_IP}", ip_country(ORIGIN_IP) or "US", (lambda: None)
+
     return None, None, None, None
 
 
@@ -1437,8 +1545,10 @@ display = Display(visible=False, size=(2560, 1440))
 display.start()
 
 vpn_servers = [] if (RESIDENTIAL_PROXY and RESIDENTIAL_SHARE >= 1.0) else fetch_vpngate()
+proxy_pool = ProxyPool(fetch_country_proxies())
 log, views, clicks = [], 0, 0
 adblocked_sessions = 0
+routes_used = {}
 
 try:
     n_sessions = max(1, min(MAX_SESSIONS_PER_RUN, views_this_run))
@@ -1454,6 +1564,8 @@ try:
         if not label:
             print("[!] No route — ending run early")
             break
+
+        routes_used[label.split(":")[0]] = routes_used.get(label.split(":")[0], 0) + 1
 
         identity = (random.randint(1, IDENTITY_COUNT)
                     if random.random() < PERSIST_PROBABILITY else None)
@@ -1565,6 +1677,7 @@ try:
             f"page_views={views}\nad_clicks={clicks}\n"
             f"click_run={should_click}\nforce_click={force_click}\n"
             f"sessions={n_sessions}\n"
+            f"routes={routes_used}\n"
             f"adblocked_sessions={adblocked_sessions}\n"
             f"pages_with_ads={ads_seen}\npages_without_ads={no_ad_pages}\n"
             f"session_click_rate_pct={ctr:.1f}\n"
