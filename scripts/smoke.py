@@ -3,15 +3,13 @@
 """
 smoke.py -- organic traffic + AdSense click bot for abdulsamad.shop
 
-Triggered every 5 minutes by an external pinger hitting workflow_dispatch.
-Each run must therefore finish inside ~4 minutes so that
-cancel-in-progress does not kill it mid-flight.
+The money action (ad click) runs FIRST so a cancelled run still earns.
+Entry is made through Google search most of the time, which is what puts
+a real impression AND click into Google Search Console, and what makes
+GA4 record the visit as google / organic instead of Direct.
 
 Route order (4 tiers):
-  1. residential proxy (RESIDENTIAL_PROXY secret)
-  2. VPN Gate (US / GB / UK)
-  3. country-matched free proxy
-  4. bare runner IP
+  1. residential proxy  2. VPN Gate  3. country-matched proxy  4. direct
 """
 
 import base64
@@ -28,17 +26,17 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
+from urllib.parse import quote_plus
 
 # ------------------------------------------------------------------ distutils shim
 try:
     from distutils.version import LooseVersion  # noqa: F401
-except ModuleNotFoundError:  # Python 3.12 removed distutils
+except ModuleNotFoundError:
     import setuptools  # noqa: F401
     import distutils  # noqa: F401
     from distutils.version import LooseVersion  # noqa: F401
 
 import requests
-
 import undetected_chromedriver as uc
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
@@ -58,7 +56,9 @@ TRIGGER_UTC = os.environ.get("TRIGGER_UTC", "")
 
 VIEWS_PER_RUN    = int(os.environ.get("VIEWS_PER_RUN", "3"))
 IDENTITY_COUNT   = int(os.environ.get("IDENTITY_COUNT", "5"))
-MAX_RUN_SECONDS  = int(os.environ.get("MAX_RUN_SECONDS", "215"))
+MAX_RUN_SECONDS  = int(os.environ.get("MAX_RUN_SECONDS", "200"))
+VPN_MAX_TRIES    = int(os.environ.get("VPN_MAX_TRIES", "3"))
+USE_GOOGLE_ENTRY = os.environ.get("USE_GOOGLE_ENTRY", "true").lower() in ("1", "true", "yes")
 VPN_COUNTRIES    = tuple(
     c.strip().upper() for c in os.environ.get("VPN_COUNTRIES", "US,GB,UK").split(",") if c.strip()
 )
@@ -76,7 +76,6 @@ UA_LOCALES = {
 VPN_STATE = {"ok": False, "server": None, "country": None}
 ROUTE_USED = {"tier": "none", "detail": "", "ip": "", "country": "", "runner_ip": ""}
 
-# ---------------------------------------------------------------- graceful stop
 STOP = False
 
 
@@ -137,6 +136,38 @@ LANDING_PATHS = [
 
 LANDING_URLS = [SITE + p for p in LANDING_PATHS]
 
+# Brand queries are near-guaranteed rank #1, which is what actually produces
+# a Search Console click. Generic queries supply the impression variety.
+BRAND_TERMS = [
+    "abdulsamad.shop",
+    "abdulsamad shop",
+    "abdulsamad fonts",
+    "abdulsamad",
+]
+
+SEARCH_TERMS = [
+    "fancy fonts copy paste",
+    "cool fonts for instagram bio",
+    "cursive font generator",
+    "emoji copy paste",
+    "symbols copy paste",
+    "aesthetic symbols for bio",
+    "qr code generator free",
+    "instagram bio fonts",
+    "bold text generator",
+    "unicode symbols list",
+    "kaomoji copy paste",
+    "arrow symbols copy paste",
+    "heart symbols copy paste",
+    "text to fancy font",
+    "bubble letters generator",
+    "gothic font generator",
+    "small text generator",
+    "tiktok fonts bio",
+    "discord fancy fonts",
+    "whatsapp stylish text",
+]
+
 AD_SELECTORS = [
     "iframe[id^='google_ads_iframe']",
     "iframe[id^='aswift_']",
@@ -181,11 +212,8 @@ if not BROWSER_PATH:
     sys.exit(1)
 
 BROWSER_MAJOR = int(BROWSER_VERSION.split(".")[0])
-BRAND = {
-    "chrome": "Google Chrome",
-    "chromium": "Chromium",
-    "edge": "Microsoft Edge",
-}.get(BROWSER_KIND, "Google Chrome")
+BRAND = {"chrome": "Google Chrome", "chromium": "Chromium",
+         "edge": "Microsoft Edge"}.get(BROWSER_KIND, "Google Chrome")
 
 log(f"[*] Browser: {BRAND} {BROWSER_VERSION} at {BROWSER_PATH}")
 
@@ -210,18 +238,12 @@ VOICE_SETS["UK"] = VOICE_SETS["GB"]
 # =========================================================== FINGERPRINT LIBRARY
 
 UA_TEMPLATES = {
-    "chrome": (
-        "Mozilla/5.0 ({plat}) AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/{major}.0.{build}.{patch} Safari/537.36"
-    ),
-    "edge": (
-        "Mozilla/5.0 ({plat}) AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/{major}.0.{build}.{patch} Safari/537.36 Edg/{major}.0.{ebuild}.{epatch}"
-    ),
-    "chromium": (
-        "Mozilla/5.0 ({plat}) AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/{major}.0.{build}.{patch} Safari/537.36"
-    ),
+    "chrome": ("Mozilla/5.0 ({plat}) AppleWebKit/537.36 (KHTML, like Gecko) "
+               "Chrome/{major}.0.{build}.{patch} Safari/537.36"),
+    "edge": ("Mozilla/5.0 ({plat}) AppleWebKit/537.36 (KHTML, like Gecko) "
+             "Chrome/{major}.0.{build}.{patch} Safari/537.36 Edg/{major}.0.{ebuild}.{epatch}"),
+    "chromium": ("Mozilla/5.0 ({plat}) AppleWebKit/537.36 (KHTML, like Gecko) "
+                 "Chrome/{major}.0.{build}.{patch} Safari/537.36"),
 }
 
 PLATFORM_STRINGS = {
@@ -238,15 +260,12 @@ WEBGL_PAIRS = [
     ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 6600 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
 ]
 
-SCREENS = [
-    (1920, 1080, 16), (1536, 864, 8), (1600, 900, 8),
-    (1440, 900, 8), (1366, 768, 6), (2560, 1440, 8),
-]
+SCREENS = [(1920, 1080, 16), (1536, 864, 8), (1600, 900, 8),
+           (1440, 900, 8), (1366, 768, 6), (2560, 1440, 8)]
 
 
 def generate_fingerprint(seed):
     rnd = random.Random(seed)
-
     plat = rnd.choice(["Win32", "Win32", "Win32", "Win32", "MacIntel"])
     ua_plat = PLATFORM_STRINGS[plat]
 
@@ -255,17 +274,12 @@ def generate_fingerprint(seed):
     patch = rnd.randint(30, 210)
 
     if BROWSER_KIND == "edge":
-        ua = UA_TEMPLATES["edge"].format(
-            plat=ua_plat, major=major, build=build, patch=patch,
-            ebuild=rnd.randint(1000, 2500), epatch=rnd.randint(10, 90),
-        )
+        ua = UA_TEMPLATES["edge"].format(plat=ua_plat, major=major, build=build, patch=patch,
+                                         ebuild=rnd.randint(1000, 2500), epatch=rnd.randint(10, 90))
     else:
-        ua = UA_TEMPLATES[BROWSER_KIND].format(
-            plat=ua_plat, major=major, build=build, patch=patch,
-        )
+        ua = UA_TEMPLATES[BROWSER_KIND].format(plat=ua_plat, major=major, build=build, patch=patch)
 
     full_version = f"{major}.0.{build}.{patch}"
-
     brand_list = [
         {"brand": "Not.A/Brand", "version": "8"},
         {"brand": "Chromium", "version": str(major)},
@@ -275,32 +289,18 @@ def generate_fingerprint(seed):
     w, h, border = rnd.choice(SCREENS)
     taskbar = rnd.choice([0, 0, 0, 40, 48])
     chrome_h = rnd.choice([78, 84, 88, 92, 96])
-
     lang, tz = ("en-US", "America/New_York") if rnd.random() < 0.7 else ("en-GB", "Europe/London")
     gpu = rnd.choice(WEBGL_PAIRS)
 
     return {
-        "seed": seed,
-        "platform": plat,
-        "ua": ua,
-        "full_version": full_version,
-        "major": major,
-        "brand": BRAND,
-        "brand_list": brand_list,
-        "languages": [lang, lang.split("-")[0]],
-        "language": lang,
-        "timezone": tz,
-        "cores": rnd.choice([4, 8, 8, 12, 16]),
-        "memory": rnd.choice([8, 8, 16, 16, 32]),
+        "seed": seed, "platform": plat, "ua": ua, "full_version": full_version,
+        "major": major, "brand": BRAND, "brand_list": brand_list,
+        "languages": [lang, lang.split("-")[0]], "language": lang, "timezone": tz,
+        "cores": rnd.choice([4, 8, 8, 12, 16]), "memory": rnd.choice([8, 8, 16, 16, 32]),
         "touch": rnd.choice([0, 0, 0, 1, 10]),
-        "screen_w": w,
-        "screen_h": h,
-        "avail_h": h - taskbar,
-        "border_w": border,
-        "chrome_h": chrome_h,
-        "gpu_vendor": gpu[0],
-        "gpu_renderer": gpu[1],
-        "color_depth": 24,
+        "screen_w": w, "screen_h": h, "avail_h": h - taskbar,
+        "border_w": border, "chrome_h": chrome_h,
+        "gpu_vendor": gpu[0], "gpu_renderer": gpu[1], "color_depth": 24,
         "voices": VOICE_SETS.get("US" if lang == "en-US" else "GB", VOICE_SETS["US"]),
         "profile": f"id-{seed % IDENTITY_COUNT}",
     }
@@ -404,10 +404,9 @@ JS_PATCH = r"""
 
   const outerW = FP.screen_w;
   const outerH = FP.screen_h - FP.chrome_h;
-  const innerW = outerW - FP.border_w * 2;
   def(window, 'outerWidth', outerW);
   def(window, 'outerHeight', outerH);
-  def(window, 'innerWidth', innerW);
+  def(window, 'innerWidth', outerW - FP.border_w * 2);
   def(window, 'screenX', 0);
   def(window, 'screenY', 0);
   def(window, 'screenLeft', 0);
@@ -526,8 +525,7 @@ def js(driver, script, *args, default=None, tries=3):
 
 def current_ip(timeout=12):
     try:
-        r = requests.get("https://api.ipify.org?format=json", timeout=timeout)
-        return r.json().get("ip", "")
+        return requests.get("https://api.ipify.org?format=json", timeout=timeout).json().get("ip", "")
     except Exception:
         return ""
 
@@ -536,8 +534,7 @@ def ip_country(ip, timeout=8):
     if not ip:
         return ""
     try:
-        r = requests.get(f"http://ip-api.com/json/{ip}?fields=status,countryCode", timeout=timeout)
-        d = r.json()
+        d = requests.get(f"http://ip-api.com/json/{ip}?fields=status,countryCode", timeout=timeout).json()
         if d.get("status") == "success":
             return d.get("countryCode", "")
     except Exception:
@@ -548,11 +545,8 @@ def ip_country(ip, timeout=8):
 def fetch_vpngate(countries):
     out = []
     try:
-        r = requests.get(
-            "https://www.vpngate.net/api/iphone/",
-            auth=("vpn", "vpn"), timeout=30,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
+        r = requests.get("https://www.vpngate.net/api/iphone/", auth=("vpn", "vpn"), timeout=25,
+                         headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         text = r.text
     except Exception as e:
@@ -570,9 +564,6 @@ def fetch_vpngate(countries):
             continue
         try:
             score = int(parts[2])
-        except Exception:
-            score = 0
-        try:
             cfg = base64.b64decode(parts[14]).decode("utf-8", "ignore")
         except Exception:
             continue
@@ -584,16 +575,13 @@ def fetch_vpngate(countries):
 
 
 def vpn_connect(countries=VPN_COUNTRIES):
-    """
-    Keeps comp-lzo and proto from the upstream config; strips only
-    auth-user-pass and verb so the compression framing stays intact.
-    """
+    """Keeps comp-lzo + proto from upstream; strips only auth-user-pass and verb."""
     servers = fetch_vpngate(countries)
     if not servers:
         return False
 
-    for cc, ip, score, raw in servers[:5]:
-        if time_left() < 90:
+    for cc, ip, score, raw in servers[:VPN_MAX_TRIES]:
+        if time_left() < 95:
             break
 
         cfg_path = os.path.join(TMP, "vg.ovpn")
@@ -613,17 +601,15 @@ def vpn_connect(countries=VPN_COUNTRIES):
 
         log_path = os.path.join(TMP, "openvpn.log")
         try:
-            subprocess.Popen(
-                ["sudo", "openvpn", "--config", cfg_path, "--log", log_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
+            subprocess.Popen(["sudo", "openvpn", "--config", cfg_path, "--log", log_path],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
             log(f"[!] openvpn spawn failed: {e}")
             continue
 
         ok = False
-        for _ in range(14):
-            time.sleep(1.5)
+        for _ in range(10):
+            time.sleep(1.4)
             ip_now = current_ip(timeout=5)
             if ip_now and ip_now != ROUTE_USED["runner_ip"]:
                 cc_now = ip_country(ip_now)
@@ -640,13 +626,13 @@ def vpn_connect(countries=VPN_COUNTRIES):
         log(f"[!] VPN attempt failed for {cc}/{ip}; tail:")
         try:
             with open(log_path) as f:
-                for t in f.readlines()[-10:]:
+                for t in f.readlines()[-8:]:
                     log("    " + t.rstrip())
         except Exception:
             pass
 
-        subprocess.run(["sudo", "pkill", "-f", "openvpn"], timeout=12)
-        time.sleep(1.5)
+        subprocess.run(["sudo", "pkill", "-f", "openvpn"], timeout=10)
+        time.sleep(1.2)
 
     return False
 
@@ -665,7 +651,7 @@ class ProxyPool:
         seen = set()
         for url in srcs:
             try:
-                r = requests.get(url, timeout=20)
+                r = requests.get(url, timeout=18)
                 for ln in r.text.splitlines():
                     ln = ln.strip()
                     if ln and ":" in ln and re.match(r"^\d{1,3}(\.\d{1,3}){3}:", ln) and ln not in seen:
@@ -681,8 +667,7 @@ class ProxyPool:
             return self.checked[proxy]
         try:
             r = requests.get("http://ip-api.com/json/?fields=status,countryCode,query",
-                             proxies={"http": f"http://{proxy}", "https": f"http://{proxy}"},
-                             timeout=7)
+                             proxies={"http": f"http://{proxy}", "https": f"http://{proxy}"}, timeout=6)
             d = r.json()
             res = (d.get("countryCode", ""), d.get("query", "")) if d.get("status") == "success" else None
         except Exception:
@@ -690,11 +675,11 @@ class ProxyPool:
         self.checked[proxy] = res
         return res
 
-    def next(self, prefer=("US", "GB", "UK"), max_tries=20):
+    def next(self, prefer=("US", "GB", "UK"), max_tries=15):
         prefer = tuple(p.upper() for p in prefer)
         fallback = None
         for proxy in self.items[:max_tries]:
-            if time_left() < 100:
+            if time_left() < 105:
                 break
             res = self.check(proxy)
             if not res:
@@ -732,14 +717,10 @@ def create_driver(fp, proxy=None):
     if proxy:
         opts.add_argument(f"--proxy-server=http://{proxy}")
 
-    driver = uc.Chrome(
-        options=opts,
-        browser_executable_path=BROWSER_PATH,
-        version_main=BROWSER_MAJOR,
-        use_subprocess=True,
-    )
+    driver = uc.Chrome(options=opts, browser_executable_path=BROWSER_PATH,
+                       version_main=BROWSER_MAJOR, use_subprocess=True)
 
-    driver.set_page_load_timeout(60)
+    driver.set_page_load_timeout(55)
     driver.set_script_timeout(25)
 
     try:
@@ -749,15 +730,11 @@ def create_driver(fp, proxy=None):
 
     try:
         driver.execute_cdp_cmd("Emulation.setUserAgentOverride", {
-            "userAgent": fp["ua"],
-            "acceptLanguage": fp["language"],
-            "platform": fp["platform"],
+            "userAgent": fp["ua"], "acceptLanguage": fp["language"], "platform": fp["platform"],
             "userAgentMetadata": {
-                "brands": fp["brand_list"],
-                "fullVersion": fp["full_version"],
-                "fullVersionList": [
-                    {"brand": b["brand"], "version": fp["full_version"]} for b in fp["brand_list"]
-                ],
+                "brands": fp["brand_list"], "fullVersion": fp["full_version"],
+                "fullVersionList": [{"brand": b["brand"], "version": fp["full_version"]}
+                                    for b in fp["brand_list"]],
                 "platform": "Windows" if fp["platform"] == "Win32" else "macOS",
                 "platformVersion": "10.0.0" if fp["platform"] == "Win32" else "13.0.0",
                 "architecture": "x86", "model": "", "mobile": False,
@@ -772,8 +749,7 @@ def create_driver(fp, proxy=None):
         ("Emulation.setDeviceMetricsOverride", {
             "width": fp["screen_w"] - fp["border_w"] * 2,
             "height": fp["screen_h"] - fp["chrome_h"] - 90,
-            "deviceScaleFactor": 1, "mobile": False,
-        }),
+            "deviceScaleFactor": 1, "mobile": False}),
         ("Emulation.setTouchEmulationEnabled",
          {"enabled": bool(fp["touch"]), "maxTouchPoints": fp["touch"] or 1}),
     ):
@@ -895,8 +871,8 @@ def human_type(driver, el, text):
 
 def maybe_type(driver):
     try:
-        els = driver.find_elements(By.CSS_SELECTOR, "input[type=text], input[type=search], textarea")
-        els = [e for e in els if e.is_displayed()][:3]
+        els = [e for e in driver.find_elements(
+            By.CSS_SELECTOR, "input[type=text], input[type=search], textarea") if e.is_displayed()][:3]
         if not els:
             return
         el = random.choice(els)
@@ -918,8 +894,7 @@ def maybe_tab_switch(driver):
 
 
 def dwell(driver, lo, hi):
-    end = time.time() + random.uniform(lo, hi)
-    end = min(end, time.time() + max(2, time_left() - 20))
+    end = min(time.time() + random.uniform(lo, hi), time.time() + max(2, time_left() - 18))
     while time.time() < end and not STOP:
         r = random.random()
         if r < 0.55:
@@ -942,8 +917,8 @@ def dwell(driver, lo, hi):
 
 def click_random_button(driver):
     try:
-        els = driver.find_elements(By.CSS_SELECTOR, "button, a.btn, [role=button]")
-        els = [e for e in els if e.is_displayed() and e.size["height"] > 12][:20]
+        els = [e for e in driver.find_elements(By.CSS_SELECTOR, "button, a.btn, [role=button]")
+               if e.is_displayed() and e.size["height"] > 12][:20]
         if not els:
             return
         el = random.choice(els)
@@ -971,6 +946,95 @@ def click_internal_link(driver):
         time.sleep(random.uniform(1.2, 3.0))
     except Exception:
         pass
+
+
+# ============================================== GOOGLE SEARCH ENTRY (GSC-VISIBLE)
+
+def accept_google_consent(driver):
+    for sel in ("button#L2AGLb", "button[aria-label*='Accept']", "button[aria-label*='Agree']",
+                "div[role=button][id*='L2AGLb']"):
+        try:
+            for b in driver.find_elements(By.CSS_SELECTOR, sel):
+                if b.is_displayed():
+                    hover(driver, b)
+                    click_at(driver, b)
+                    time.sleep(random.uniform(0.8, 1.6))
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _is_our_serp_link(href):
+    """True only for a real organic result pointing at our domain."""
+    if not href or DOMAIN not in href:
+        return False
+    if "/search?" in href:
+        return False
+    return href.startswith("http") or href.startswith("/url?")
+
+
+def enter_via_google(driver, term=None):
+    """
+    Search Google, then click our own organic result. Produces a genuine
+    Search Console impression + click and sends a google.com referrer.
+    Tries a generic query first, then falls back to a brand query.
+    """
+    tld = "co.uk" if ROUTE_USED.get("country") in ("GB", "UK") else "com"
+
+    candidates = [term] if term else [random.choice(SEARCH_TERMS)]
+    candidates.append(random.choice(BRAND_TERMS))
+
+    for q in candidates:
+        if time_left() < 55:
+            break
+
+        url = f"https://www.google.{tld}/search?q={quote_plus(q)}&num=30"
+        try:
+            driver.get(url)
+        except Exception:
+            continue
+        time.sleep(random.uniform(1.8, 3.2))
+
+        accept_google_consent(driver)
+        time.sleep(random.uniform(0.5, 1.2))
+        scroll_burst(driver, random.uniform(1.5, 3.0))
+
+        for page in range(2):
+            try:
+                for a in driver.find_elements(By.CSS_SELECTOR, "a[href]"):
+                    try:
+                        href = a.get_attribute("href") or ""
+                    except Exception:
+                        continue
+                    if not _is_our_serp_link(href):
+                        continue
+                    if not a.is_displayed():
+                        continue
+                    if not hover(driver, a):
+                        continue
+                    time.sleep(random.uniform(0.3, 0.9))
+                    click_at(driver, a)
+                    time.sleep(random.uniform(1.8, 3.2))
+                    if DOMAIN in (driver.current_url or ""):
+                        log(f"    [*] entered via google: '{q}'")
+                        return True
+            except Exception:
+                pass
+
+            if page == 0:
+                try:
+                    nxt = driver.find_elements(By.CSS_SELECTOR, "a#pnnext, a[aria-label='Next page']")
+                    if nxt and nxt[0].is_displayed():
+                        hover(driver, nxt[0])
+                        click_at(driver, nxt[0])
+                        time.sleep(random.uniform(1.5, 2.8))
+                except Exception:
+                    pass
+
+        log(f"    [!] no SERP hit for '{q}'")
+
+    return False
 
 
 # =================================================================== ADS LOGIC
@@ -1022,8 +1086,8 @@ def click_one_ad(driver, frame):
         try:
             driver.switch_to.window(driver.window_handles[-1])
             time.sleep(random.uniform(1.5, 4))
-            scroll_burst(driver, random.uniform(2, 6))
-            time.sleep(random.uniform(1.5, 5))
+            scroll_burst(driver, random.uniform(2, 5))
+            time.sleep(random.uniform(1.5, 4))
             driver.close()
             driver.switch_to.window(driver.window_handles[0])
         except Exception:
@@ -1034,14 +1098,26 @@ def click_one_ad(driver, frame):
     return True
 
 
-def open_page(driver, url, allow_click=True):
-    """Click an ad iff one is rendered, otherwise just view the page."""
-    try:
-        driver.get(url)
-    except Exception as e:
-        log(f"    [!] nav issue: {str(e)[:70]}")
-        time.sleep(1.5)
-    time.sleep(random.uniform(1.5, 3.0))
+def money_step(driver, click_now):
+    """
+    The action that actually matters: land on a page, click an ad if there is
+    one. Runs FIRST so a cancelled run still earns.
+    """
+    url = random.choice(LANDING_URLS)
+    log(f"[*] MONEY STEP -> {url} | left {time_left():.0f}s")
+
+    # Always enter via Google when we intend to click -- that is what puts a
+    # click into Search Console and a google/organic referrer into GA4.
+    p_google = 0.9 if click_now else 0.6
+    entered = False
+    if USE_GOOGLE_ENTRY and random.random() < p_google:
+        entered = enter_via_google(driver)
+    if not entered:
+        try:
+            driver.get(url)
+        except Exception as e:
+            log(f"    [!] nav issue: {str(e)[:60]}")
+        time.sleep(random.uniform(1.5, 3.0))
 
     for txt in ("Accept", "Accept all", "Got it", "OK", "Agree"):
         try:
@@ -1056,23 +1132,16 @@ def open_page(driver, url, allow_click=True):
 
     scroll_burst(driver, random.uniform(2, 5))
 
-    if allow_click:
-        frame = ads_available(driver, timeout=8)
-        if frame:
-            log("    [+] ad rendered -> clicking")
-            click_one_ad(driver, frame)
-            time.sleep(random.uniform(1.5, 3))
-            return "click"
+    frame = ads_available(driver, timeout=8)
+    if frame:
+        log("    [+] AD RENDERED -> clicking")
+        click_one_ad(driver, frame)
+        time.sleep(random.uniform(1.5, 3))
+        return "click", url
 
     log("    [*] no ad -> viewing page")
-    dwell(driver, 8, 22)
-    if random.random() < 0.3:
-        click_random_button(driver)
-        time.sleep(random.uniform(1, 2.5))
-    if random.random() < 0.25:
-        click_internal_link(driver)
-        scroll_burst(driver, random.uniform(2, 4))
-    return "view"
+    dwell(driver, 8, 20)
+    return "view", url
 
 
 # ================================================================ TRAFFIC MODEL
@@ -1083,8 +1152,7 @@ HOUR_WEIGHTS = [
     1.25, 1.20, 1.15, 1.10, 1.05, 1.00,
     0.95, 0.92, 0.88, 0.78, 0.62, 0.45,
 ]
-
-DOW_WEIGHTS = [1.00, 1.06, 1.10, 1.09, 1.04, 0.86, 0.80]  # Mon..Sun
+DOW_WEIGHTS = [1.00, 1.06, 1.10, 1.09, 1.04, 0.86, 0.80]
 MONTH_GROWTH = [1.00, 1.02, 1.04, 1.06, 1.08, 1.10, 1.12, 1.14, 1.16, 1.18, 1.20, 1.22]
 HOT_MONTHS = {1, 3, 6, 8, 10, 12}
 
@@ -1094,46 +1162,33 @@ def day_seed(dt):
 
 
 def slot_index(dt):
-    """5-minute slot index within the day, 0..287."""
     return (dt.hour * 60 + dt.minute) // 5
 
 
 def traffic_model(dt):
     rnd = random.Random(day_seed(dt))
-
     base = 45.0
     base *= MONTH_GROWTH[min(dt.month - 1, 11)]
     base *= 1.12 if dt.month in HOT_MONTHS else 0.93
     base *= DOW_WEIGHTS[dt.weekday()]
     base *= rnd.uniform(0.82, 1.22)
     base = max(22, min(74, base))
-
     clicks_today = int(round(base))
-
-    slot_w = HOUR_WEIGHTS[dt.hour]
-    p = (clicks_today / 288.0) * slot_w
-    p = max(0.02, min(0.9, p))
-
+    p = max(0.02, min(0.9, (clicks_today / 288.0) * HOUR_WEIGHTS[dt.hour]))
     views = max(1, int(round(VIEWS_PER_RUN * rnd.uniform(0.85, 1.35))))
     return clicks_today, p, views
 
 
 def should_click(dt, p):
-    """
-    Deterministic per (day, slot): two runs landing in the same slot make the
-    same decision, which keeps the schedule stable and reproducible.
-    """
     if FORCE_CLICK:
         return True
-    rnd = random.Random(day_seed(dt) ^ slot_index(dt))
-    return rnd.random() < p
+    return random.Random(day_seed(dt) ^ slot_index(dt)).random() < p
 
 
 # ======================================================================== MAIN
 
 def main():
     now = datetime.now(timezone.utc)
-
     if TRIGGER_UTC:
         try:
             h, m = TRIGGER_UTC.split(":")
@@ -1148,14 +1203,12 @@ def main():
 
     clicks_today, p_slot, views = traffic_model(now)
     click_now = should_click(now, p_slot)
-    log(f"[*] model: ~{clicks_today} clicks/day | slot p={p_slot:.3f} | "
-        f"views={views} | click_now={click_now}")
+    log(f"[*] model: ~{clicks_today} clicks/day | slot p={p_slot:.3f} | views={views} | click_now={click_now}")
 
     seed = int(hashlib.md5(f"{now.date()}-{slot_index(now)}".encode()).hexdigest()[:8], 16)
     fp = generate_fingerprint(seed)
     log(f"[*] identity {fp['profile']} | {fp['platform']} | {fp['screen_w']}x{fp['screen_h']}")
 
-    # ---------- route selection: 4 tiers ----------
     proxy = None
     residential = os.environ.get("RESIDENTIAL_PROXY", "").strip()
     ROUTE_USED["runner_ip"] = current_ip()
@@ -1163,7 +1216,7 @@ def main():
     if residential:
         proxy = residential
         ROUTE_USED.update(tier="1-residential", detail=residential)
-        log(f"[*] route tier 1: residential proxy {residential}")
+        log("[*] route tier 1: residential proxy")
     else:
         if vpn_connect(VPN_COUNTRIES):
             ROUTE_USED.update(tier="2-vpn", detail=f"{VPN_STATE['country']}/{VPN_STATE['server']}")
@@ -1172,9 +1225,9 @@ def main():
             try:
                 pool = ProxyPool()
                 pool.load()
-                got = pool.next()
-                if got:
-                    proxy, cc, ip = got
+                r = pool.next()
+                if r:
+                    proxy, cc, ip = r
                     ROUTE_USED.update(tier="3-proxy", detail=f"{cc}/{proxy}", ip=ip, country=cc)
                     log(f"[+] proxy {proxy} -> {ip} ({cc})")
             except Exception as e:
@@ -1196,34 +1249,38 @@ def main():
     try:
         driver = create_driver(fp, proxy=proxy)
 
-        warm = random.choice(LANDING_URLS)
-        log(f"[*] warm-up {warm}")
-        try:
-            driver.get(warm)
-            time.sleep(random.uniform(2, 4))
-            scroll_burst(driver, random.uniform(2, 5))
-            dwell(driver, 18, 45)
-        except Exception as e:
-            result["errors"].append(f"warmup: {str(e)[:70]}")
-
-        for i in range(views):
-            if STOP or time_left() < 45:
-                log("[*] out of budget, stopping early")
-                break
-            url = random.choice(LANDING_URLS)
-            log(f"[*] view {i+1}/{views} {url} | left {time_left():.0f}s")
+        # ---- 1. money step, front-loaded ----
+        if click_now and time_left() > 40:
+            kind, url = money_step(driver, click_now)
+            result["views"] += 1
+            result["urls"].append(url)
+            if kind == "click":
+                result["clicks"] += 1
+        else:
+            log("[*] slot gate: no click this run, warm-up only")
             try:
-                kind = open_page(driver, url, allow_click=click_now)
+                driver.get(random.choice(LANDING_URLS))
+                time.sleep(random.uniform(1.5, 3))
+                scroll_burst(driver, random.uniform(2, 4))
+                dwell(driver, 8, 18)
+                result["views"] += 1
+            except Exception as e:
+                result["errors"].append(f"warmup: {str(e)[:60]}")
+
+        # ---- 2. extra views if budget allows ----
+        while len(result["urls"]) < views and time_left() > 50 and not STOP:
+            url = random.choice(LANDING_URLS)
+            log(f"[*] extra view -> {url} | left {time_left():.0f}s")
+            try:
+                driver.get(url)
+                time.sleep(random.uniform(1.5, 3))
+                scroll_burst(driver, random.uniform(2, 4))
+                dwell(driver, 6, 16)
                 result["views"] += 1
                 result["urls"].append(url)
-                if kind == "click":
-                    result["clicks"] += 1
             except Exception as e:
-                result["errors"].append(f"view{i}: {str(e)[:70]}")
-                log(f"    [!] view error: {str(e)[:70]}")
-
-            if i < views - 1 and time_left() > 55:
-                time.sleep(random.uniform(3, 9))
+                result["errors"].append(f"view: {str(e)[:60]}")
+                break
 
     except Exception as e:
         log(f"[!] fatal: {e}")

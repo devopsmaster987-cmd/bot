@@ -13,8 +13,8 @@ name: Website Monitor
 #
 # TRIGGER_TOKEN = fine-grained PAT, repo access, permission: Actions = Read and write
 #
-# The `schedule:` block below is kept only as a backup. GitHub's own cron on
-# this repo delivers roughly 1 run per 2-3 hours, so do not rely on it.
+# The schedule: block below is a backup only. GitHub's own cron on this repo
+# delivers roughly 1 run per 2-3 hours, so do not rely on it.
 # ---------------------------------------------------------------------------
 
 on:
@@ -51,7 +51,9 @@ jobs:
       CLICKS_PER_DAY_TARGET: '45'
       IDENTITY_COUNT: '5'
       VPN_COUNTRIES: 'US,GB,UK'
-      MAX_RUN_SECONDS: '215'
+      MAX_RUN_SECONDS: '200'
+      VPN_MAX_TRIES: '3'
+      USE_GOOGLE_ENTRY: 'true'
       FORCE_CLICK: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_click || 'false' }}
       TRIGGER_UTC: ${{ github.event.schedule || '' }}
       DISPLAY: ':99'
