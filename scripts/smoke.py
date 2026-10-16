@@ -4,19 +4,18 @@
 smoke.py - hardened anti-detection AdSense traffic bot for abdulsamad.shop
 
 Daily model
-  DAILY_CLICK_TARGET = 60 clicks/day, spread across DAILY_RUN_TARGET runs
-  (60 / 10 clicks per run = 6 runs per day pass the slot gate).
-  A cached daily counter hard-stops the day once 60 clicks are reached.
-  The slot gate self-corrects: behind schedule -> more likely to pass,
-  ahead of schedule -> less likely to pass.
+  DAILY_CLICK_TARGET = 60 clicks/day -> DAILY_RUN_TARGET = 60/10 = 6 runs/day.
+  Pacing is driven by RUNS, not clicks, so the schedule stays correct while
+  AdSense is unapproved and clicks are still 0.
+  A run that passes the gate is charged 10 against the daily budget; the day
+  hard-stops at 6 runs. The counter is cached in .bot-state so it survives
+  across workflow runs.
 
 Per run
-  10 ad clicks (when AdSense renders) and 10 page views, hard capped at
-  MAX_PAGES_PER_RUN so a run can never overrun its budget.
+  Up to 10 ad clicks and 10 page views, hard capped at MAX_PAGES_PER_RUN.
 
 Route preference
   residential proxy -> VPN Gate (JP/KR/EU) -> country-matched free proxy -> direct
-  Each tier has its own budget so a dead tier cannot starve the session.
 """
 
 from __future__ import annotations
@@ -57,10 +56,27 @@ from selenium.webdriver.common.keys import Keys
 START = time.time()
 RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
+
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
+def env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def log(msg: str) -> None:
+    print(f"[{int(time.time() - START):>4}s] {msg}", flush=True)
+
+
+def budget_left(deadline: float) -> float:
+    return deadline - time.time()
+
+
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-SITE = os.environ.get("SITE_URL", "https://www.abdulsamad.shop").rstrip("/")
+SITE = (os.environ.get("SITE_URL") or os.environ.get("SITE") or
+        "https://www.abdulsamad.shop").rstrip("/")
 SITE_HOST = SITE.replace("https://", "").replace("http://", "").strip("/")
 SITE_FRAG = SITE_HOST.replace("www.", "")
 
@@ -72,10 +88,10 @@ MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "720"))
 
 # ---- per day ---------------------------------------------------------------
 DAILY_CLICK_TARGET = int(os.environ.get("DAILY_CLICK_TARGET", "60"))
-RUNS_PER_DAY = int(os.environ.get("RUNS_PER_DAY", "104"))  # 96 pinger + ~8 gh cron
-DAILY_RUN_TARGET = float(
-    os.environ.get("DAILY_RUN_TARGET", str(DAILY_CLICK_TARGET / max(TARGET_CLICKS, 1)))
-)
+DAILY_RUN_TARGET = int(os.environ.get(
+    "DAILY_RUN_TARGET", str(max(DAILY_CLICK_TARGET // max(TARGET_CLICKS, 1), 1))))
+# Expected number of trigger invocations per day (pinger + github cron).
+RUNS_PER_DAY = int(os.environ.get("RUNS_PER_DAY", "104"))
 
 # ---- tier budgets ----------------------------------------------------------
 VPN_BUDGET = int(os.environ.get("VPN_BUDGET", "60"))
@@ -83,14 +99,14 @@ PROXY_BUDGET = int(os.environ.get("PROXY_BUDGET", "30"))
 VPN_MAX_TRIES = int(os.environ.get("VPN_MAX_TRIES", "6"))
 GOOGLE_CAP = int(os.environ.get("GOOGLE_CAP", "60"))
 
-FORCE_CLICK = os.environ.get("FORCE_CLICK", "0").strip() == "1"
-IGNORE_DAILY_CAP = os.environ.get("IGNORE_DAILY_CAP", "0").strip() == "1"
+FORCE_CLICK = env_flag("FORCE_CLICK")
+IGNORE_DAILY_CAP = env_flag("IGNORE_DAILY_CAP")
 RESIDENTIAL_PROXY = os.environ.get("RESIDENTIAL_PROXY", "").strip()
 
 WORKDIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROFILE_ROOT = os.path.join(WORKDIR, ".chrome-profiles")
 STATE_DIR = os.path.join(WORKDIR, ".bot-state")
-STATE_PATH = os.path.join(STATE_DIR, "daily_clicks.json")
+STATE_PATH = os.path.join(STATE_DIR, "daily_state.json")
 SUMMARY_PATH = os.path.join(WORKDIR, "run_summary.json")
 
 VPN_DIR = tempfile.mkdtemp(prefix="vpn-")
@@ -111,17 +127,6 @@ PAGES = [
     "/arrow-symbols", "/checkmark-symbols", "/star-symbols", "/currency-symbols",
     "/math-symbols", "/bracket-symbols", "/misc-symbols", "/random-text",
 ]
-
-
-# ---------------------------------------------------------------------------
-# LOGGING
-# ---------------------------------------------------------------------------
-def log(msg: str) -> None:
-    print(f"[{int(time.time() - START):>4}s] {msg}", flush=True)
-
-
-def budget_left(deadline: float) -> float:
-    return deadline - time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +176,7 @@ def cdp_move(driver, x, y, steps=8):
 
 
 # ---------------------------------------------------------------------------
-# TRAFFIC MODEL (deterministic per day, self-correcting per hour)
+# TRAFFIC MODEL
 # ---------------------------------------------------------------------------
 HOUR_WEIGHTS = {
     0: 0.35, 1: 0.25, 2: 0.20, 3: 0.18, 4: 0.20, 5: 0.30,
@@ -186,6 +191,8 @@ MONTH_GROWTH = {
 }
 HOT_MONTHS = {11, 12}
 
+TOTAL_HOUR_WEIGHT = sum(HOUR_WEIGHTS.values())
+
 
 def day_seed() -> int:
     now = datetime.now(timezone.utc)
@@ -196,15 +203,30 @@ def today_key() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def weight_fraction(now: datetime) -> float:
+    upto = sum(v for h, v in HOUR_WEIGHTS.items() if h <= now.hour)
+    return upto / TOTAL_HOUR_WEIGHT
+
+
+def daily_run_target() -> int:
+    """Deterministic per-day run budget, jittered +-1 for natural variation."""
+    rng = random.Random(day_seed())
+    jitter = rng.choice([-1, 0, 0, 0, 1])
+    return max(1, DAILY_RUN_TARGET + jitter)
+
+
 def load_state() -> dict:
     try:
         with open(STATE_PATH) as fh:
             st = json.load(fh)
         if st.get("date") == today_key():
+            st.setdefault("runs", 0)
+            st.setdefault("clicks", 0)
+            st.setdefault("views", 0)
             return st
     except Exception:
         pass
-    return {"date": today_key(), "clicks": 0, "runs": 0}
+    return {"date": today_key(), "runs": 0, "clicks": 0, "views": 0}
 
 
 def save_state(st: dict) -> None:
@@ -217,68 +239,40 @@ def save_state(st: dict) -> None:
         log(f"[!] state save failed: {e}")
 
 
-def expected_clicks_by_now(now: datetime) -> float:
-    total = sum(HOUR_WEIGHTS.values())
-    upto = sum(v for h, v in HOUR_WEIGHTS.items() if h <= now.hour)
-    return DAILY_CLICK_TARGET * (upto / total)
-
-
 def slot_gate(state: dict) -> bool:
+    """
+    Charge a passing run 10 toward the daily click budget. Pacing is on RUNS
+    so it stays correct while AdSense is unapproved and clicks are still 0.
+    """
+    target_runs = daily_run_target()
+    runs_done = state.get("runs", 0)
+
     if FORCE_CLICK:
-        log("[*] slot gate: FORCE_CLICK -> PASS")
+        log(f"[*] slot gate: FORCE_CLICK -> PASS (run {runs_done + 1}/{target_runs})")
         return True
 
-    done = state.get("clicks", 0)
-    if done >= DAILY_CLICK_TARGET and not IGNORE_DAILY_CAP:
-        log(f"[*] slot gate: daily cap reached ({done}/{DAILY_CLICK_TARGET}) -> SKIP")
+    if runs_done >= target_runs and not IGNORE_DAILY_CAP:
+        log(f"[*] slot gate: daily run budget spent ({runs_done}/{target_runs}) -> SKIP")
+        return False
+
+    if state.get("clicks", 0) >= DAILY_CLICK_TARGET and not IGNORE_DAILY_CAP:
+        log(f"[*] slot gate: daily click cap reached "
+            f"({state['clicks']}/{DAILY_CLICK_TARGET}) -> SKIP")
         return False
 
     now = datetime.now(timezone.utc)
     rng = random.Random(day_seed() ^ int(now.timestamp() // 900))
 
-    base = DAILY_RUN_TARGET / max(RUNS_PER_DAY, 1)
-    prob = (
-        base
-        * HOUR_WEIGHTS.get(now.hour, 1.0)
-        * DOW_WEIGHTS.get(now.weekday(), 1.0)
-        * MONTH_GROWTH.get(now.month, 1.0)
-    )
-    if now.month in HOT_MONTHS:
-        prob *= 1.08
+    remaining_runs = max(target_runs - runs_done, 0)
+    remaining_triggers = max(RUNS_PER_DAY * (1.0 - weight_fraction(now)), 1.0)
+    prob = remaining_runs / remaining_triggers
+    prob = min(max(prob, 0.02), 0.90)
 
-    # self-correcting controller against the daily target
-    expect = expected_clicks_by_now(now)
-    if expect > 0:
-        ratio = done / expect
-        if ratio < 0.7:
-            prob *= 1.8
-            tag = "catch-up"
-        elif ratio < 0.9:
-            prob *= 1.25
-            tag = "slightly-behind"
-        elif ratio > 1.4:
-            prob *= 0.5
-            tag = "slow-down"
-        elif ratio > 1.15:
-            prob *= 0.75
-            tag = "slightly-ahead"
-        else:
-            tag = "on-track"
-    else:
-        tag = "start"
-
-    # do not overshoot the daily cap
-    room = DAILY_CLICK_TARGET - done
-    if room <= TARGET_CLICKS:
-        prob = min(prob, 0.9) if room > 0 else 0.0
-
-    prob = min(max(prob, 0.0), 0.95)
     roll = rng.random()
     ok = roll < prob
-    log(
-        f"[*] slot gate: p={prob:.3f} roll={roll:.3f} done={done}/{DAILY_CLICK_TARGET} "
-        f"expect={expect:.1f} {tag} -> {'PASS' if ok else 'SKIP'}"
-    )
+    log(f"[*] slot gate: p={prob:.3f} roll={roll:.3f} "
+        f"runs={runs_done}/{target_runs} remaining_triggers~{remaining_triggers:.0f} "
+        f"-> {'PASS' if ok else 'SKIP'}")
     return ok
 
 
@@ -795,7 +789,6 @@ def _on_sorry_page(driver) -> bool:
 
 
 def handle_google_interstitial(driver, deadline: float) -> bool:
-    """Google serves /sorry/ to datacenter IPs. Try to clear it."""
     if not _on_sorry_page(driver):
         return False
     log("    [!] google interstitial detected")
@@ -1011,7 +1004,6 @@ def _click_one_ad_inner(driver) -> bool:
 
 
 def click_one_ad(driver, deadline: float) -> bool:
-    """One-shot retry so a stale frame cannot inflate the click counter."""
     for attempt in range(2):
         if budget_left(deadline) <= 0:
             return False
@@ -1048,7 +1040,8 @@ SUMMARY = {
     "clicks": 0,
     "views": 0,
     "google_entry": False,
-    "targets": {"clicks": TARGET_CLICKS, "views": TARGET_VIEWS, "daily_clicks": DAILY_CLICK_TARGET},
+    "targets": {"clicks": TARGET_CLICKS, "views": TARGET_VIEWS,
+                "daily_clicks": DAILY_CLICK_TARGET, "daily_runs": DAILY_RUN_TARGET},
     "errors": [],
 }
 _summary_written = False
@@ -1084,20 +1077,24 @@ signal.signal(signal.SIGTERM, _sigterm)
 def main() -> int:
     state = load_state()
     log(f"[*] run {RUN_ID}  site={SITE}")
-    log(f"[*] per-run targets: {TARGET_CLICKS} clicks / {TARGET_VIEWS} views "
-        f"| daily target: {DAILY_CLICK_TARGET} clicks "
-        f"(done today: {state.get('clicks', 0)}) | budget {MAX_RUN_SECONDS}s")
+    log(f"[*] per-run: {TARGET_CLICKS} clicks / {TARGET_VIEWS} views | "
+        f"daily: {daily_run_target()} runs = {DAILY_CLICK_TARGET} clicks "
+        f"(runs done today: {state.get('runs', 0)}) | budget {MAX_RUN_SECONDS}s")
 
     if not slot_gate(state):
         log("[*] slot skipped, exiting")
         write_summary()
         return 0
 
+    # charge the run immediately so concurrent runs cannot both take a slot
+    state["runs"] = state.get("runs", 0) + 1
+    save_state(state)
+
     pages = fetch_pages()
     log(f"[*] page pool: {len(pages)}")
 
     vpn_countries = {
-        c.strip().upper()
+        c.strip().upper().replace("UK", "GB")
         for c in os.environ.get("VPN_COUNTRIES", "US,GB,DE,NL,FR,SG,CA,AU").split(",")
         if c.strip()
     }
@@ -1239,10 +1236,9 @@ def main() -> int:
                     clicks += 1
                     SUMMARY["clicks"] = clicks
                     log(f"[+] AD CLICKED ({clicks}/{TARGET_CLICKS}) | views {views}/{TARGET_VIEWS}")
-                    time.sleep(random.uniform(8, 22))
                 else:
                     log(f"[*] ad click missed ({clicks}/{TARGET_CLICKS}) | views {views}/{TARGET_VIEWS}")
-                    time.sleep(random.uniform(8, 22))
+                time.sleep(random.uniform(8, 22))
             else:
                 log(f"[*] no ad -> viewing page ({views}/{TARGET_VIEWS})")
 
@@ -1264,12 +1260,11 @@ def main() -> int:
         stop_vpn(vpn_proc)
         shutil.rmtree(VPN_DIR, ignore_errors=True)
 
-        # update the daily counter
         state["clicks"] = state.get("clicks", 0) + SUMMARY["clicks"]
-        state["runs"] = state.get("runs", 0) + 1
+        state["views"] = state.get("views", 0) + SUMMARY["views"]
         save_state(state)
-        log(f"[*] daily counter: {state['clicks']}/{DAILY_CLICK_TARGET} clicks, "
-            f"{state['runs']} runs today")
+        log(f"[*] daily state: runs={state['runs']}/{daily_run_target()} "
+            f"clicks={state['clicks']} views={state['views']}")
 
     return 0
 
