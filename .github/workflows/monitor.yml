@@ -1,115 +1,112 @@
 name: Website Monitor
 
+# ---------------------------------------------------------------------------
+# PRIMARY TRIGGER: external pinger (cron-job.org / Cloudflare Worker)
+#
+#   URL:    https://api.github.com/repos/devopsmaster987-cmd/bot/actions/workflows/monitor.yml/dispatches
+#   Method: POST
+#   Header: Authorization: Bearer <TRIGGER_TOKEN>
+#           Accept: application/vnd.github+json
+#           Content-Type: application/json
+#   Body:   {"ref":"main"}
+#   Every:  5 minutes
+#
+# TRIGGER_TOKEN = fine-grained PAT, repo access, permission: Actions = Read and write
+#
+# The `schedule:` block below is kept only as a backup. GitHub's own cron on
+# this repo delivers roughly 1 run per 2-3 hours, so do not rely on it.
+# ---------------------------------------------------------------------------
+
 on:
-  workflow_dispatch:
-    inputs:
-      run_browser_smoke:
-        description: Run the browser job manually
-        required: true
-        type: boolean
-        default: true
-      force_click:
-        description: Force an ad click this run (testing only)
-        required: false
-        type: boolean
-        default: false
   schedule:
     - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_click:
+        description: 'Force an ad click on this run'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 permissions:
   contents: read
 
+concurrency:
+  # A new ping cancels a stale in-flight run instead of queueing behind it.
+  group: website-monitor
+  cancel-in-progress: true
+
 jobs:
-  http-monitor:
+  traffic:
+    name: Organic traffic run
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: HTTP check
-        run: |
-          code=$(curl -s -o /dev/null -w "%{http_code}" -L --max-time 20 "https://www.abdulsamad.shop")
-          echo "HTTP status: $code"
-          if [ "$code" -ge 400 ] || [ "$code" -eq 0 ]; then
-            echo "::error::site returned $code"
-            exit 1
-          fi
+    timeout-minutes: 8
 
-  browser-smoke:
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_browser_smoke == true)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - name: Record trigger time
-        run: echo "TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%S)" >> "$GITHUB_ENV"
+    env:
+      SITE: 'https://www.abdulsamad.shop'
+      VIEWS_PER_RUN: '3'
+      CLICKS_PER_DAY_TARGET: '45'
+      IDENTITY_COUNT: '5'
+      VPN_COUNTRIES: 'US,GB,UK'
+      MAX_RUN_SECONDS: '215'
+      FORCE_CLICK: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_click || 'false' }}
+      TRIGGER_UTC: ${{ github.event.schedule || '' }}
+      DISPLAY: ':99'
+      PYTHONUNBUFFERED: '1'
 
-      - name: Check out repository
+    steps:
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install Chrome Stable
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: stable
-
-      - name: Install Xvfb, OpenVPN, Edge and fonts
+      - name: Install system packages
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb openvpn \
-            fonts-liberation fonts-noto fonts-noto-color-emoji \
-            fonts-dejavu fonts-freefont-ttf fonts-crosextra-carlito \
-            fonts-crosextra-caladea ttf-mscorefonts-installer
-          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
-            | gpg --dearmor | sudo tee /usr/share/keyrings/microsoft.gpg > /dev/null
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/edge stable main" \
-            | sudo tee /etc/apt/sources.list.d/microsoft-edge.list
-          sudo apt-get update
-          sudo apt-get install -y microsoft-edge-stable || true
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            xvfb openvpn unzip curl \
+            fonts-liberation fonts-noto-color-emoji \
+            fonts-dejavu-core fonts-freefont-ttf
 
-      - name: Install Python deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install setuptools wheel selenium undetected-chromedriver pyvirtualdisplay requests
-
-      - name: Restore persistent identities
-        uses: actions/cache/restore@v4
+      - name: Restore browser identities
+        uses: actions/cache@v4
         with:
-          path: .chrome-profiles
-          key: chrome-profiles-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ~/.chrome-profiles
+          key: chrome-profiles-${{ github.run_number }}
           restore-keys: |
             chrome-profiles-
 
-      - name: Run smoke test
-        env:
-          RESIDENTIAL_PROXY: ${{ secrets.RESIDENTIAL_PROXY }}
-          RESIDENTIAL_SHARE: ${{ vars.RESIDENTIAL_SHARE }}
-          FORCE_CLICK: ${{ inputs.force_click }}
-        run: python scripts/smoke.py
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --quiet undetected-chromedriver selenium requests
 
-      - name: Save persistent identities
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: .chrome-profiles
-          key: chrome-profiles-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Start virtual display
+        run: |
+          Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
+          sleep 2
+          echo "Xvfb up on :99"
+
+      - name: Verify network tools
+        run: |
+          which openvpn && openvpn --version | head -n 1
+          test -c /dev/net/tun && echo "/dev/net/tun present"
+
+      - name: Run traffic bot
+        run: python -u scripts/smoke.py
 
       - name: Publish summary
         if: always()
         run: |
-          {
-            echo "### Smoke run"
-            echo '```'
-            cat reports/summary.txt 2>/dev/null || echo "no summary"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: smoke-reports
-          path: reports/
-          if-no-files-found: ignore
-          retention-days: 3
+          if [ -f run_summary.json ]; then
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat run_summary.json >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi

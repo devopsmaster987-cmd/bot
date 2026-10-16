@@ -1,1695 +1,1259 @@
 #!/usr/bin/env python3
-"""Organic-traffic smoke test with gated ad clicks.
+# -*- coding: utf-8 -*-
+"""
+smoke.py -- organic traffic + AdSense click bot for abdulsamad.shop
 
-Routes every session through, in order of preference: a residential proxy,
-a free US/UK VPN, a free US/GB proxy, or the runner's own IP. Presents a
-consistent browser identity, behaves like a human visitor, and clicks an ad
-on a small number of runs per day.
+Triggered every 5 minutes by an external pinger hitting workflow_dispatch.
+Each run must therefore finish inside ~4 minutes so that
+cancel-in-progress does not kill it mid-flight.
+
+Route order (4 tiers):
+  1. residential proxy (RESIDENTIAL_PROXY secret)
+  2. VPN Gate (US / GB / UK)
+  3. country-matched free proxy
+  4. bare runner IP
 """
 
 import base64
 import hashlib
 import json
+import math
 import os
 import random
 import re
+import shutil
+import signal
 import subprocess
+import sys
+import tempfile
 import time
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+
+# ------------------------------------------------------------------ distutils shim
+try:
+    from distutils.version import LooseVersion  # noqa: F401
+except ModuleNotFoundError:  # Python 3.12 removed distutils
+    import setuptools  # noqa: F401
+    import distutils  # noqa: F401
+    from distutils.version import LooseVersion  # noqa: F401
 
 import requests
+
+import undetected_chromedriver as uc
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
-# Python 3.12 dropped distutils from the stdlib, and undetected_chromedriver
-# still imports distutils.version. Importing setuptools installs the meta-path
-# finder that re-exposes distutils, so this works even if the .pth hook missed.
-try:
-    import distutils  # noqa: F401
-except ModuleNotFoundError:
-    import setuptools  # noqa: F401
-    import distutils  # noqa: F401
+# ====================================================================== CONFIG
 
-import undetected_chromedriver as uc
-from pyvirtualdisplay import Display
+SITE       = os.environ.get("SITE", "https://www.abdulsamad.shop").rstrip("/")
+SITE_HOST  = re.sub(r"^https?://", "", SITE).split("/")[0]
+DOMAIN     = SITE_HOST[4:] if SITE_HOST.startswith("www.") else SITE_HOST
 
-# ═══════════════════════════════ CONFIG ═══════════════════════════════
-TARGET_SITE = os.environ.get("TARGET_URL") or "https://www.abdulsamad.shop"
-TARGET_HOST = "abdulsamad.shop"
+RUN_ID     = os.environ.get("GITHUB_RUN_ID", str(int(time.time())))
+RUN_NUMBER = os.environ.get("GITHUB_RUN_NUMBER", "0")
+EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "schedule")
+FORCE_CLICK = os.environ.get("FORCE_CLICK", "false").lower() in ("1", "true", "yes")
+TRIGGER_UTC = os.environ.get("TRIGGER_UTC", "")
 
-BASE_PAGE_VIEWS = 3
-MAX_SESSIONS_PER_RUN = 6
-MAX_VIEWS_PER_SESSION = 8
-MIN_DWELL_DESKTOP = (35, 180)
-MIN_DWELL_MOBILE = (20, 95)
-MIN_GAP, MAX_GAP = 10, 30
+VIEWS_PER_RUN    = int(os.environ.get("VIEWS_PER_RUN", "3"))
+IDENTITY_COUNT   = int(os.environ.get("IDENTITY_COUNT", "5"))
+MAX_RUN_SECONDS  = int(os.environ.get("MAX_RUN_SECONDS", "215"))
+VPN_COUNTRIES    = tuple(
+    c.strip().upper() for c in os.environ.get("VPN_COUNTRIES", "US,GB,UK").split(",") if c.strip()
+)
 
-CLICKS_PER_DAY = 45
-VPN_COUNTRIES = ("US", "GB", "UK")
-MAX_VPN_ATTEMPTS = 4
-VPN_CONNECT_TIMEOUT = 45
-VPN_SHORTLIST = 60
-ALLOW_DIRECT = True
+PROFILE_ROOT = os.path.expanduser("~/.chrome-profiles")
+TMP = tempfile.mkdtemp(prefix="smoke-")
+START_TS = time.time()
 
-MOBILE_PROBABILITY = 0.45
-PERSIST_PROBABILITY = 0.60
-ADBLOCK_PROBABILITY = 0.15
-IDENTITY_COUNT = 5
+UA_LOCALES = {
+    "US": ("en-US", "America/New_York"),
+    "GB": ("en-GB", "Europe/London"),
+    "UK": ("en-GB", "Europe/London"),
+}
 
-AUDIENCE_TZ = "Europe/London"
-HOUR_WEIGHTS = [2, 1, 1, 1, 1, 1, 2, 3, 5, 6, 7, 7, 7, 7, 7, 7, 8, 9, 10, 10, 9, 8, 6, 4]
-MEAN_WEIGHT = sum(HOUR_WEIGHTS) / 24.0
+VPN_STATE = {"ok": False, "server": None, "country": None}
+ROUTE_USED = {"tier": "none", "detail": "", "ip": "", "country": "", "runner_ip": ""}
 
-RESIDENTIAL_PROXY = (os.environ.get("RESIDENTIAL_PROXY") or "").strip() or None
-try:
-    RESIDENTIAL_SHARE = float(os.environ.get("RESIDENTIAL_SHARE") or "0.7")
-except ValueError:
-    RESIDENTIAL_SHARE = 0.7
+# ---------------------------------------------------------------- graceful stop
+STOP = False
 
-PROFILE_ROOT = os.path.join(os.getcwd(), ".chrome-profiles")
-os.makedirs("reports", exist_ok=True)
 
-ADBLOCK_URLS = [
-    "*doubleclick.net*",
-    "*googlesyndication.com*",
-    "*googleadservices.com*",
-    "*adservice.google.com*",
+def _on_term(signum, frame):
+    global STOP
+    STOP = True
+    log(f"[!] signal {signum} -> finishing up")
+
+
+signal.signal(signal.SIGTERM, _on_term)
+signal.signal(signal.SIGINT, _on_term)
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+def time_left():
+    return MAX_RUN_SECONDS - (time.time() - START_TS)
+
+
+# ================================================================ LANDING PAGES
+
+LANDING_PATHS = [
+    "/", "/fonts", "/fonts/fancy", "/fonts/cursive", "/fonts/bold", "/fonts/italic",
+    "/fonts/gothic", "/fonts/bubble", "/fonts/small", "/fonts/stylish", "/fonts/arabic",
+    "/fonts/urdu", "/fonts/hindi", "/fonts/korean", "/fonts/japanese", "/fonts/hebrew",
+    "/fonts/russian", "/fonts/greek", "/fonts/thai", "/fonts/chinese",
+    "/emoji", "/emoji/smileys", "/emoji/animals", "/emoji/food", "/emoji/travel",
+    "/emoji/activities", "/emoji/objects", "/emoji/symbols", "/emoji/flags",
+    "/emoji/people", "/emoji/nature", "/emoji/hearts",
+    "/symbols", "/symbols/arrows", "/symbols/math", "/symbols/currency",
+    "/symbols/check", "/symbols/star", "/symbols/heart", "/symbols/line",
+    "/symbols/box", "/symbols/circle", "/symbols/triangle",
+    "/qr-code", "/qr-code/generator", "/qr-code/wifi", "/qr-code/vcard",
+    "/qr-code/url", "/qr-code/text", "/qr-code/email", "/qr-code/sms",
+    "/instagram-fonts", "/facebook-fonts", "/twitter-fonts", "/tiktok-fonts",
+    "/whatsapp-fonts", "/discord-fonts", "/youtube-fonts", "/snapchat-fonts",
+    "/name-generator", "/username-generator", "/bio-generator", "/caption-generator",
+    "/hashtag-generator",
+    "/text-tools", "/word-counter", "/case-converter", "/text-repeater",
+    "/text-reverse", "/remove-line-breaks", "/text-to-slug", "/lorem-ipsum",
+    "/ascii-art", "/ascii-faces", "/lenny-face", "/kaomoji", "/emoticons",
+    "/unicode", "/unicode-table", "/html-entities", "/html-symbols", "/css-symbols",
+    "/braille", "/morse-code", "/binary-code", "/sign-language",
+    "/borders", "/dividers", "/frames", "/decorations",
+    "/blog", "/blog/best-fancy-fonts", "/blog/instagram-bio-ideas",
+    "/blog/emoji-meanings", "/blog/qr-code-guide", "/blog/unicode-explained",
+    "/about", "/contact", "/privacy-policy", "/terms", "/faq",
+    "/tools", "/tools/font-generator", "/tools/emoji-picker",
+    "/tools/symbol-picker", "/tools/qr-scanner",
+    "/cool-symbols", "/cute-symbols", "/aesthetic-symbols", "/rare-symbols",
+    "/arrow-symbols", "/heart-symbols", "/star-symbols", "/flower-symbols",
+    "/music-symbols", "/weather-symbols", "/zodiac-symbols", "/chess-symbols",
+    "/card-symbols", "/dice-symbols", "/sport-symbols", "/religion-symbols",
+    "/tech-symbols", "/money-symbols", "/clock-symbols", "/math-symbols",
 ]
 
-VPN_STATE = {"healthy": True}
+LANDING_URLS = [SITE + p for p in LANDING_PATHS]
 
-# ═══════════════════════════ BROWSER DETECTION ═══════════════════════════
-def _version_of(cmd):
-    try:
-        out = subprocess.check_output(
-            f"{cmd} --version", shell=True, stderr=subprocess.DEVNULL
-        ).decode()
-        m = re.search(r"(\d+)\.(\d+)\.(\d+)\.(\d+)", out)
-        if m:
-            return m.group(1), ".".join(m.groups())
-        m = re.search(r"(\d+)\.", out)
-        if m:
-            return m.group(1), f"{m.group(1)}.0.0.0"
-    except Exception:
-        pass
-    return None, None
+AD_SELECTORS = [
+    "iframe[id^='google_ads_iframe']",
+    "iframe[id^='aswift_']",
+    "ins.adsbygoogle iframe",
+    "div[id^='google_ads_iframe']",
+    "iframe[name^='google_ads_iframe']",
+    "iframe[src*='googlesyndication']",
+    "iframe[src*='googleads']",
+    "iframe[src*='doubleclick']",
+]
 
+# ============================================================ BROWSER DETECTION
 
-CHROME_MAJOR, CHROME_FULL = None, None
-for _c in ("google-chrome-stable", "google-chrome", "chrome", "chromium", "chromium-browser"):
-    CHROME_MAJOR, CHROME_FULL = _version_of(_c)
-    if CHROME_MAJOR:
-        break
-if not CHROME_MAJOR:
-    CHROME_MAJOR, CHROME_FULL = "126", "126.0.6478.126"
-print(f"[*] Detected Chrome {CHROME_FULL}")
-
-EDGE_BIN = None
-for _p in (
-    "/usr/bin/microsoft-edge-stable",
-    "/usr/bin/microsoft-edge",
-    "/opt/microsoft/msedge/microsoft-edge",
-):
-    if os.path.exists(_p):
-        EDGE_BIN = _p
-        break
-
-EDGE_MAJOR, EDGE_FULL = (_version_of(EDGE_BIN) if EDGE_BIN else (None, None))
-if EDGE_BIN and EDGE_MAJOR != CHROME_MAJOR:
-    print(f"[!] Edge {EDGE_MAJOR} != Chrome {CHROME_MAJOR}; using Chrome for Edge identities")
-    EDGE_BIN = None
-elif EDGE_BIN:
-    print(f"[*] Real Edge available {EDGE_FULL}")
-
-# environment sanity
-_ovpn = subprocess.run("which openvpn", shell=True, capture_output=True).stdout.decode().strip()
-print(f"[*] openvpn binary: {_ovpn or 'MISSING'}")
-print(f"[*] /dev/net/tun: {'present' if os.path.exists('/dev/net/tun') else 'MISSING'}")
-
-
-def brands_for(edge=False):
-    out = [
-        {"brand": "Not/A)Brand", "version": "24"},
-        {"brand": "Chromium", "version": CHROME_MAJOR},
+def find_browser():
+    cands = [
+        ("chrome", "/usr/bin/google-chrome"),
+        ("chrome", "/usr/bin/google-chrome-stable"),
+        ("chrome", "/opt/google/chrome/chrome"),
+        ("chromium", "/usr/bin/chromium"),
+        ("chromium", "/usr/bin/chromium-browser"),
+        ("edge", "/usr/bin/microsoft-edge"),
+        ("edge", "/usr/bin/microsoft-edge-stable"),
+        ("edge", "/opt/microsoft/msedge/msedge"),
     ]
-    if edge:
-        out.append({"brand": "Microsoft Edge", "version": EDGE_MAJOR or CHROME_MAJOR})
-    else:
-        out.append({"brand": "Google Chrome", "version": CHROME_MAJOR})
-    return out
-
-
-CHROME_BRANDS = brands_for(False)
-EDGE_BRANDS = brands_for(True)
-
-# ═══════════════════════════ VOICE LISTS ═══════════════════════════
-VOICES_WIN = [
-    {"voiceURI": "Microsoft David - English (United States)", "name": "Microsoft David - English (United States)", "lang": "en-US", "localService": True, "default": True},
-    {"voiceURI": "Microsoft Zira - English (United States)", "name": "Microsoft Zira - English (United States)", "lang": "en-US", "localService": True, "default": False},
-    {"voiceURI": "Microsoft Mark - English (United States)", "name": "Microsoft Mark - English (United States)", "lang": "en-US", "localService": True, "default": False},
-    {"voiceURI": "Microsoft Hazel - English (United Kingdom)", "name": "Microsoft Hazel - English (United Kingdom)", "lang": "en-GB", "localService": True, "default": False},
-]
-VOICES_MAC = [
-    {"voiceURI": "Samantha", "name": "Samantha", "lang": "en-US", "localService": True, "default": True},
-    {"voiceURI": "Alex", "name": "Alex", "lang": "en-US", "localService": True, "default": False},
-    {"voiceURI": "Daniel", "name": "Daniel", "lang": "en-GB", "localService": True, "default": False},
-]
-VOICES_LINUX = [
-    {"voiceURI": "English (America)", "name": "English (America)", "lang": "en-US", "localService": True, "default": True},
-    {"voiceURI": "English (Great Britain)", "name": "English (Great Britain)", "lang": "en-GB", "localService": True, "default": False},
-]
-
-# ═══════════════════════════ FINGERPRINT LIBRARY ═══════════════════════════
-DESKTOP_PROFILES = [
-    {
-        "weight": 5, "browser": "chrome", "os_kind": "windows",
-        "ua": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{CHROME_MAJOR}.0.0.0 Safari/537.36",
-        "platform": "Win32", "ua_platform": "Windows",
-        "platform_versions": ["10.0.0", "15.0.0"], "arch": "x86",
-        "webgl_vendor": "Google Inc. (Intel)",
-        "webgl_renderer": "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-        "dpr": [1, 1.25, 1.5], "cores": [4, 8, 12, 16], "mem": [4, 8, 16],
-    },
-    {
-        "weight": 2, "browser": "edge", "os_kind": "windows",
-        "ua": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{CHROME_MAJOR}.0.0.0 Safari/537.36 Edg/{EDGE_FULL or CHROME_FULL}",
-        "platform": "Win32", "ua_platform": "Windows",
-        "platform_versions": ["10.0.0", "15.0.0"], "arch": "x86",
-        "webgl_vendor": "Google Inc. (NVIDIA)",
-        "webgl_renderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-        "dpr": [1, 1.25], "cores": [8, 12, 16], "mem": [8, 16],
-    },
-    {
-        "weight": 3, "browser": "chrome", "os_kind": "macos",
-        "ua": f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{CHROME_MAJOR}.0.0.0 Safari/537.36",
-        "platform": "MacIntel", "ua_platform": "macOS",
-        "platform_versions": ["14.5.0", "13.6.0"], "arch": "arm",
-        "webgl_vendor": "Google Inc. (Apple)",
-        "webgl_renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)",
-        "dpr": [2], "cores": [8, 10], "mem": [8, 16],
-    },
-    {
-        "weight": 1, "browser": "edge", "os_kind": "macos",
-        "ua": f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{CHROME_MAJOR}.0.0.0 Safari/537.36 Edg/{EDGE_FULL or CHROME_FULL}",
-        "platform": "MacIntel", "ua_platform": "macOS",
-        "platform_versions": ["14.5.0"], "arch": "arm",
-        "webgl_vendor": "Google Inc. (Apple)",
-        "webgl_renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
-        "dpr": [2], "cores": [8], "mem": [8],
-    },
-    {
-        "weight": 1, "browser": "chrome", "os_kind": "linux",
-        "ua": f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{CHROME_MAJOR}.0.0.0 Safari/537.36",
-        "platform": "Linux x86_64", "ua_platform": "Linux",
-        "platform_versions": ["6.5.0"], "arch": "x86",
-        "webgl_vendor": "Google Inc. (Intel)",
-        "webgl_renderer": "ANGLE (Intel, Mesa Intel(R) UHD Graphics 620 (KBL GT2), OpenGL 4.6)",
-        "dpr": [1], "cores": [4, 8], "mem": [8],
-    },
-]
-
-MOBILE_PROFILES = [
-    {
-        "weight": 5, "model": "Pixel 7", "platform": "Android",
-        "platform_version": "13.0.0", "arch": "",
-        "ua": f"Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{CHROME_MAJOR}.0.0.0 Mobile Safari/537.36",
-        "vw": 412, "vh": 915, "dpr": 2.625,
-        "webgl_vendor": "Google Inc. (Qualcomm)",
-        "webgl_renderer": "ANGLE (Qualcomm, Adreno (TM) 730, OpenGL ES 3.2)",
-    },
-    {
-        "weight": 3, "model": "SM-G991B", "platform": "Android",
-        "platform_version": "13.0.0", "arch": "",
-        "ua": f"Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{CHROME_MAJOR}.0.0.0 Mobile Safari/537.36",
-        "vw": 360, "vh": 800, "dpr": 3.0,
-        "webgl_vendor": "Google Inc. (ARM)",
-        "webgl_renderer": "ANGLE (ARM, Mali-G78 MP14, OpenGL ES 3.2)",
-    },
-    {
-        "weight": 2, "model": "Pixel 6a", "platform": "Android",
-        "platform_version": "14.0.0", "arch": "",
-        "ua": f"Mozilla/5.0 (Linux; Android 14; Pixel 6a) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{CHROME_MAJOR}.0.0.0 Mobile Safari/537.36",
-        "vw": 412, "vh": 892, "dpr": 2.625,
-        "webgl_vendor": "Google Inc. (ARM)",
-        "webgl_renderer": "ANGLE (ARM, Mali-G78 MP20, OpenGL ES 3.2)",
-    },
-]
-
-COUNTRY_PROFILES = {
-    "US": {
-        "locales": ["en-US"],
-        "tzs": ["America/New_York", "America/Chicago", "America/Denver",
-                "America/Los_Angeles", "America/Phoenix"],
-    },
-    "GB": {"locales": ["en-GB"], "tzs": ["Europe/London"]},
-    "UK": {"locales": ["en-GB"], "tzs": ["Europe/London"]},
-}
-
-OS_CHROME = {
-    "windows": {"taskbar": 40, "chrome_h": (87, 145), "border_w": (16, 18), "avail_top": 0, "hint": "full"},
-    "macos": {"taskbar": 25, "chrome_h": (88, 88), "border_w": (0, 1), "avail_top": 25, "hint": "none"},
-    "linux": {"taskbar": 27, "chrome_h": (85, 140), "border_w": (15, 18), "avail_top": 0, "hint": "slight"},
-}
-
-DESKTOP_WINDOWS = [(1366, 768), (1440, 900), (1536, 864), (1600, 900), (1280, 720), (1680, 1050)]
-DESKTOP_SCREENS = [(1920, 1080), (2560, 1440), (3840, 2160), (1600, 900), (1366, 768)]
-
-SEARCH_QUERIES = [
-    "cool fonts to copy and paste", "instagram bio fonts", "free qr code generator",
-    "aesthetic symbols copy paste", "fancy text generator", "kaomoji copy paste",
-    "bold text generator", "upside down text generator", "cute symbols for bio",
-]
-REFERRER_SITES = [
-    "https://www.instagram.com/", "https://twitter.com/", "https://www.reddit.com/",
-    "https://www.pinterest.com/", "https://www.facebook.com/",
-]
-TYPE_SAMPLES = [
-    "Hello world", "cool fonts", "aesthetic bio", "Abdul Samad", "test 123",
-    "bold text here", "sparkle", "Nice!", "insta bio ideas", "2026",
-]
-
-LANDING_PAGES = [
-    "https://www.abdulsamad.shop/",
-    "https://www.abdulsamad.shop/fonts",
-    "https://www.abdulsamad.shop/symbols",
-    "https://www.abdulsamad.shop/emoji",
-    "https://www.abdulsamad.shop/kaomoji",
-    "https://www.abdulsamad.shop/tools",
-    "https://www.abdulsamad.shop/image-compression",
-    "https://www.abdulsamad.shop/qr-code-generator",
-    "https://www.abdulsamad.shop/studio",
-    "https://www.abdulsamad.shop/embed",
-    "https://www.abdulsamad.shop/about",
-    "https://www.abdulsamad.shop/privacy",
-    "https://www.abdulsamad.shop/terms",
-    "https://www.abdulsamad.shop/contact",
-    "https://www.abdulsamad.shop/styles",
-    "https://www.abdulsamad.shop/styles/instagram",
-    "https://www.abdulsamad.shop/styles/whatsapp",
-    "https://www.abdulsamad.shop/styles/discord",
-    "https://www.abdulsamad.shop/styles/gaming",
-    "https://www.abdulsamad.shop/styles/languages",
-    "https://www.abdulsamad.shop/styles/colours",
-    "https://www.abdulsamad.shop/fonts/bold",
-    "https://www.abdulsamad.shop/fonts/italic",
-    "https://www.abdulsamad.shop/fonts/bold-italic",
-    "https://www.abdulsamad.shop/fonts/script",
-    "https://www.abdulsamad.shop/fonts/bold-script",
-    "https://www.abdulsamad.shop/fonts/fraktur",
-    "https://www.abdulsamad.shop/fonts/bold-fraktur",
-    "https://www.abdulsamad.shop/fonts/double-struck",
-    "https://www.abdulsamad.shop/fonts/sans",
-    "https://www.abdulsamad.shop/fonts/sans-bold",
-    "https://www.abdulsamad.shop/fonts/sans-italic",
-    "https://www.abdulsamad.shop/fonts/sans-bold-italic",
-    "https://www.abdulsamad.shop/fonts/monospace",
-    "https://www.abdulsamad.shop/fonts/fullwidth",
-    "https://www.abdulsamad.shop/fonts/circled",
-    "https://www.abdulsamad.shop/fonts/negative-circled",
-    "https://www.abdulsamad.shop/fonts/squared",
-    "https://www.abdulsamad.shop/fonts/negative-squared",
-    "https://www.abdulsamad.shop/fonts/parenthesized",
-    "https://www.abdulsamad.shop/fonts/small-caps",
-    "https://www.abdulsamad.shop/fonts/superscript",
-    "https://www.abdulsamad.shop/fonts/subscript",
-    "https://www.abdulsamad.shop/fonts/underline",
-    "https://www.abdulsamad.shop/fonts/double-underline",
-    "https://www.abdulsamad.shop/fonts/overline",
-    "https://www.abdulsamad.shop/fonts/strike",
-    "https://www.abdulsamad.shop/fonts/slash",
-    "https://www.abdulsamad.shop/fonts/wavy",
-    "https://www.abdulsamad.shop/fonts/dotted",
-    "https://www.abdulsamad.shop/fonts/short-strike",
-    "https://www.abdulsamad.shop/fonts/short-slash",
-    "https://www.abdulsamad.shop/fonts/tilde-under",
-    "https://www.abdulsamad.shop/fonts/tilde-strike",
-    "https://www.abdulsamad.shop/fonts/bar-under",
-    "https://www.abdulsamad.shop/fonts/dot-above",
-    "https://www.abdulsamad.shop/fonts/double-dot-under",
-    "https://www.abdulsamad.shop/fonts/arrow-under",
-    "https://www.abdulsamad.shop/fonts/triple-underline",
-    "https://www.abdulsamad.shop/fonts/strike-underline",
-    "https://www.abdulsamad.shop/fonts/overline-underline",
-    "https://www.abdulsamad.shop/fonts/overline-strike",
-    "https://www.abdulsamad.shop/fonts/wavy-under",
-    "https://www.abdulsamad.shop/fonts/dotted-underline",
-    "https://www.abdulsamad.shop/fonts/slash-under",
-    "https://www.abdulsamad.shop/fonts/bar-underline",
-    "https://www.abdulsamad.shop/fonts/wavy-strike",
-    "https://www.abdulsamad.shop/fonts/dotted-strike",
-    "https://www.abdulsamad.shop/fonts/crossed-out",
-    "https://www.abdulsamad.shop/fonts/upside-down",
-    "https://www.abdulsamad.shop/fonts/backwards",
-    "https://www.abdulsamad.shop/fonts/flipped-letters",
-    "https://www.abdulsamad.shop/fonts/backwards-words",
-    "https://www.abdulsamad.shop/fonts/upside-down-words",
-    "https://www.abdulsamad.shop/fonts/zalgo-light",
-    "https://www.abdulsamad.shop/fonts/zalgo-heavy",
-    "https://www.abdulsamad.shop/fonts/zalgo-medium",
-    "https://www.abdulsamad.shop/fonts/zalgo-extreme",
-    "https://www.abdulsamad.shop/fonts/glitch-alternate",
-    "https://www.abdulsamad.shop/fonts/sparkle-sparkle",
-    "https://www.abdulsamad.shop/fonts/stars-frame",
-    "https://www.abdulsamad.shop/fonts/alternating-case",
-    "https://www.abdulsamad.shop/fonts/all-caps",
-    "https://www.abdulsamad.shop/fonts/all-lowercase",
-    "https://www.abdulsamad.shop/fonts/symbol-star",
-    "https://www.abdulsamad.shop/fonts/symbol-heart",
-    "https://www.abdulsamad.shop/fonts/symbol-bullet",
-    "https://www.abdulsamad.shop/fonts/symbol-sparkle",
-    "https://www.abdulsamad.shop/fonts/symbol-arrow",
-    "https://www.abdulsamad.shop/fonts/symbol-guillemet",
-    "https://www.abdulsamad.shop/fonts/symbol-music",
-    "https://www.abdulsamad.shop/fonts/symbol-flower",
-    "https://www.abdulsamad.shop/fonts/symbol-join-spaced",
-    "https://www.abdulsamad.shop/fonts/emoji-sparkle",
-    "https://www.abdulsamad.shop/fonts/emoji-frame-blossom",
-    "https://www.abdulsamad.shop/fonts/emoji-frame-star",
-    "https://www.abdulsamad.shop/fonts/emoji-frame-heart",
-    "https://www.abdulsamad.shop/fonts/emoji-frame-sparkles",
-    "https://www.abdulsamad.shop/fonts/emoji-frame-fire",
-    "https://www.abdulsamad.shop/fonts/emoji-frame-party",
-    "https://www.abdulsamad.shop/fonts/kaomoji-flip",
-    "https://www.abdulsamad.shop/fonts/kaomoji-shrug",
-    "https://www.abdulsamad.shop/fonts/kaomoji-happy",
-    "https://www.abdulsamad.shop/fonts/kaomoji-cat",
-    "https://www.abdulsamad.shop/fonts/kaomoji-heart",
-    "https://www.abdulsamad.shop/fonts/clan-tag",
-    "https://www.abdulsamad.shop/fonts/gg-frame",
-    "https://www.abdulsamad.shop/fonts/console",
-    "https://www.abdulsamad.shop/fonts/shout-caps",
-    "https://www.abdulsamad.shop/fonts/respawn",
-    "https://www.abdulsamad.shop/fonts/frag-line",
-    "https://www.abdulsamad.shop/fonts/boss-mode",
-    "https://www.abdulsamad.shop/fonts/health-bar",
-    "https://www.abdulsamad.shop/fonts/bio-hearts",
-    "https://www.abdulsamad.shop/fonts/profile-stars",
-    "https://www.abdulsamad.shop/fonts/story-title",
-    "https://www.abdulsamad.shop/fonts/handle-wrap",
-    "https://www.abdulsamad.shop/fonts/soft-bio",
-    "https://www.abdulsamad.shop/fonts/aesthetic-wide",
-    "https://www.abdulsamad.shop/fonts/caption-underline",
-    "https://www.abdulsamad.shop/fonts/cute-bubble",
-]
-
-PAGE_WEIGHTS = {
-    "/": 30, "/fonts": 12, "/symbols": 8, "/emoji": 7, "/kaomoji": 5,
-    "/tools": 4, "/qr-code-generator": 4, "/image-compression": 3, "/studio": 3,
-}
-
-POINTER = {"x": 400.0, "y": 300.0}
-SESSION = {"mobile": False}
-
-
-def htime(lo, hi):
-    return lo + (hi - lo) * (random.random() ** 1.3)
-
-
-def stable_seed(*parts):
-    return int(hashlib.md5("|".join(str(p) for p in parts).encode()).hexdigest()[:8], 16)
-
-
-# ═══════════════════════════ IP / ROUTE ═══════════════════════════
-def current_ip(timeout=8):
-    try:
-        return requests.get("https://api.ipify.org", timeout=timeout).text.strip()
-    except Exception:
-        return None
-
-
-def proxy_exit_ip(pstr, timeout=10):
-    try:
-        return requests.get(
-            "https://api.ipify.org",
-            proxies={"http": f"http://{pstr}", "https": f"http://{pstr}"},
-            timeout=timeout,
-        ).text.strip()
-    except Exception:
-        return None
-
-
-def ip_country(ip):
-    try:
-        return requests.get(
-            f"http://ip-api.com/json/{ip}?fields=countryCode", timeout=8
-        ).json().get("countryCode")
-    except Exception:
-        return None
-
-
-ORIGIN_IP = current_ip()
-print(f"[*] Runner origin IP: {ORIGIN_IP}")
-print(f"[*] Residential proxy: {'set' if RESIDENTIAL_PROXY else 'not set (VPN only)'}")
-
-
-def fetch_vpngate(countries=VPN_COUNTRIES):
-    seen, servers, codes = set(), [], {}
-    total = 0
-    try:
-        r = requests.get("https://www.vpngate.net/api/iphone/", timeout=40)
-        for line in r.text.splitlines():
-            line = line.strip()
-            if not line or line[0] in "*#":
-                continue
-            p = line.split(",")
-            if len(p) < 15 or p[0] == "HostName":
-                continue
-            total += 1
-            codes[p[6]] = codes.get(p[6], 0) + 1
-            if p[1] in seen or p[6] not in countries:
-                continue
-            seen.add(p[1])
-            servers.append({
-                "ip": p[1],
-                "score": int(p[2]) if p[2].isdigit() else 0,
-                "country": p[6],
-                "config": p[14],
-            })
-    except Exception as e:
-        print(f"[!] VPN Gate fetch failed: {e}")
-
-    top = sorted(codes.items(), key=lambda kv: kv[1], reverse=True)[:8]
-    print(f"[+] VPN Gate parsed {total} rows; top countries: {top}")
-    servers.sort(key=lambda s: s["score"], reverse=True)
-    short = servers[:VPN_SHORTLIST]
-    random.shuffle(short)
-    print(f"[+] VPN Gate: {len(servers)} unique US/GB/UK servers, {len(short)} shortlisted")
-    return short
-
-
-def vpn_disconnect():
-    subprocess.run("sudo pkill -f 'openvpn --config' >/dev/null 2>&1", shell=True)
-    time.sleep(1.5)
-
-
-def vpn_connect(server, timeout=VPN_CONNECT_TIMEOUT, force_tcp=False):
-    cfg, auth, logf = "/tmp/vpg.ovpn", "/tmp/vpg.auth", "/tmp/vpg.log"
-    try:
-        data = base64.b64decode(server["config"]).decode("utf-8", "ignore")
-    except Exception as e:
-        print(f"[!] config decode failed: {e}")
-        return None, None
-
-    # drop directives we override on the command line
-    kept = []
-    for ln in data.splitlines():
-        s = ln.strip().lower()
-        if (s.startswith("auth-user-pass") or s.startswith("data-ciphers")
-                or s.startswith("cipher ") or s.startswith("verb ")
-                or s.startswith("proto ") or s.startswith("comp-lzo")):
+    for kind, path in cands:
+        p = path if os.path.exists(path) else shutil.which(os.path.basename(path))
+        if not p or not os.path.exists(p):
             continue
-        kept.append(ln)
-
-    with open(cfg, "w") as f:
-        f.write("\n".join(kept))
-        f.write("\n\n# injected by smoke.py\n")
-        f.write("proto tcp-client\n" if force_tcp else "proto udp\n")
-        f.write("data-ciphers AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305\n")
-        f.write("data-ciphers-fallback AES-128-CBC\n")
-        f.write("allow-compression yes\n")
-        f.write("auth-nocache\n")
-        f.write("redirect-gateway def1\n")
-        f.write("ping 10\nping-restart 60\n")
-        f.write("verb 4\n")
-
-    with open(auth, "w") as f:
-        f.write("vpn\nvpn\n")
-
-    vpn_disconnect()
-    subprocess.run(
-        f"sudo openvpn --config {cfg} --auth-user-pass {auth} --cd /tmp "
-        f"--daemon --log {logf} --writepid /tmp/vpg.pid",
-        shell=True, check=False,
-    )
-
-    start = time.time()
-    while time.time() - start < timeout:
-        ip = current_ip()
-        if ip and ip != ORIGIN_IP:
-            cc = ip_country(ip)
-            if cc in VPN_COUNTRIES:
-                return ip, cc
-        time.sleep(2)
-
-    try:
-        with open(logf) as f:
-            tail = f.read().strip().splitlines()[-10:]
-        print("[!] openvpn log tail:")
-        for l in tail:
-            print(f"    {l}")
-    except Exception:
-        pass
-
-    vpn_disconnect()
-    return None, None
-
-
-def fetch_country_proxies():
-    out = []
-    for u in [
-        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=us,gb",
-        "https://www.proxy-list.download/api/v1/get?type=http&country=US",
-        "https://www.proxy-list.download/api/v1/get?type=http&country=GB",
-    ]:
         try:
-            for line in requests.get(u, timeout=15).text.splitlines():
-                line = line.strip()
-                if ":" in line and " " not in line:
-                    out.append(line)
+            out = subprocess.check_output([p, "--version"], stderr=subprocess.STDOUT, timeout=15)
+            ver = re.search(r"(\d+\.\d+\.\d+\.\d+)", out.decode("utf-8", "ignore"))
+            if ver:
+                return kind, p, ver.group(1)
         except Exception:
-            pass
-    random.shuffle(out)
-    print(f"[+] Fallback proxy candidates: {len(out)}")
-    return out
+            continue
+    return None, None, None
 
 
-def validate_proxy(proxy, timeout=8):
-    try:
-        r = requests.get(
-            "https://httpbin.org/ip",
-            proxies={"http": f"http://{proxy}", "https": f"http://{proxy}"},
-            timeout=timeout,
+BROWSER_KIND, BROWSER_PATH, BROWSER_VERSION = find_browser()
+if not BROWSER_PATH:
+    log("[!] No Chromium-family browser found")
+    sys.exit(1)
+
+BROWSER_MAJOR = int(BROWSER_VERSION.split(".")[0])
+BRAND = {
+    "chrome": "Google Chrome",
+    "chromium": "Chromium",
+    "edge": "Microsoft Edge",
+}.get(BROWSER_KIND, "Google Chrome")
+
+log(f"[*] Browser: {BRAND} {BROWSER_VERSION} at {BROWSER_PATH}")
+
+# ================================================================ SPEECH VOICES
+
+VOICE_SETS = {
+    "US": [
+        ("Google US English", "en-US", True, True),
+        ("Microsoft Aria Online (Natural) - English (United States)", "en-US", True, True),
+        ("Alex", "en-US", True, False),
+        ("Samantha", "en-US", True, False),
+    ],
+    "GB": [
+        ("Google UK English Female", "en-GB", True, True),
+        ("Google UK English Male", "en-GB", True, True),
+        ("Daniel", "en-GB", True, False),
+        ("Kate", "en-GB", True, False),
+    ],
+}
+VOICE_SETS["UK"] = VOICE_SETS["GB"]
+
+# =========================================================== FINGERPRINT LIBRARY
+
+UA_TEMPLATES = {
+    "chrome": (
+        "Mozilla/5.0 ({plat}) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/{major}.0.{build}.{patch} Safari/537.36"
+    ),
+    "edge": (
+        "Mozilla/5.0 ({plat}) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/{major}.0.{build}.{patch} Safari/537.36 Edg/{major}.0.{ebuild}.{epatch}"
+    ),
+    "chromium": (
+        "Mozilla/5.0 ({plat}) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/{major}.0.{build}.{patch} Safari/537.36"
+    ),
+}
+
+PLATFORM_STRINGS = {
+    "Win32": "Windows NT 10.0; Win64; x64",
+    "MacIntel": "Macintosh; Intel Mac OS X 10_15_7",
+}
+
+WEBGL_PAIRS = [
+    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 2070 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+    ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 6600 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+]
+
+SCREENS = [
+    (1920, 1080, 16), (1536, 864, 8), (1600, 900, 8),
+    (1440, 900, 8), (1366, 768, 6), (2560, 1440, 8),
+]
+
+
+def generate_fingerprint(seed):
+    rnd = random.Random(seed)
+
+    plat = rnd.choice(["Win32", "Win32", "Win32", "Win32", "MacIntel"])
+    ua_plat = PLATFORM_STRINGS[plat]
+
+    major = BROWSER_MAJOR
+    build = rnd.randint(3000, 6900)
+    patch = rnd.randint(30, 210)
+
+    if BROWSER_KIND == "edge":
+        ua = UA_TEMPLATES["edge"].format(
+            plat=ua_plat, major=major, build=build, patch=patch,
+            ebuild=rnd.randint(1000, 2500), epatch=rnd.randint(10, 90),
         )
-        if r.status_code == 200:
-            ip = r.json().get("origin", "").split(",")[0].strip()
-            return True, ip, ip_country(ip)
-    except Exception:
-        pass
-    return False, None, None
-
-
-class ProxyPool:
-    def __init__(self, proxies):
-        self.stack = proxies[:]
-        random.shuffle(self.stack)
-
-    def next(self):
-        while self.stack:
-            p = self.stack.pop()
-            ok, ip, cc = validate_proxy(p)
-            if ok:
-                print(f"[+] Proxy OK: {p} -> {ip} ({cc})")
-                return p, ip, cc or "US"
-        return None, None, None
-
-
-def establish_route():
-    # 1 — paid residential proxy
-    if RESIDENTIAL_PROXY and random.random() < RESIDENTIAL_SHARE:
-        ip = proxy_exit_ip(RESIDENTIAL_PROXY)
-        if ip:
-            cc = ip_country(ip)
-            print(f"[+] Residential proxy exit {ip} ({cc})")
-            return RESIDENTIAL_PROXY, f"RES:{ip}", cc or "US", (lambda: None)
-        print("[!] Residential proxy unreachable, falling back")
-
-    # 2 — free VPN (one attempt only once we know it is unhealthy)
-    attempts = MAX_VPN_ATTEMPTS if VPN_STATE["healthy"] else 1
-    for attempt in range(attempts):
-        if not vpn_servers:
-            break
-        srv = random.choice(vpn_servers)
-        force_tcp = (attempt % 2 == 1)
-        print(f"[*] VPN attempt {attempt + 1}/{attempts} -> {srv['country']} {srv['ip']}"
-              f"{' (tcp)' if force_tcp else ' (udp)'}")
-        ip, cc = vpn_connect(srv, force_tcp=force_tcp)
-        if ip:
-            VPN_STATE["healthy"] = True
-            print(f"[+] Tunnel up {cc} {ip}")
-            return None, f"VPN-{cc}:{ip}", cc, vpn_disconnect
-
-    VPN_STATE["healthy"] = False
-    print("[!] VPN unavailable")
-
-    # 3 — free US/GB proxy
-    p, ip, cc = proxy_pool.next()
-    if p:
-        print(f"[+] Using fallback proxy {ip} ({cc})")
-        return p, f"PROXY:{ip}", cc or "US", (lambda: None)
-
-    # 4 — runner's own IP as a last resort
-    if ALLOW_DIRECT:
-        print(f"[!] Using direct runner IP {ORIGIN_IP}")
-        return None, f"DIRECT:{ORIGIN_IP}", ip_country(ORIGIN_IP) or "US", (lambda: None)
-
-    return None, None, None, None
-
-
-# ═══════════════════════════ FINGERPRINT ═══════════════════════════
-def weighted(items):
-    total = sum(i["weight"] for i in items)
-    r = random.uniform(0, total)
-    acc = 0
-    for i in items:
-        acc += i["weight"]
-        if acc >= r:
-            return i
-    return items[-1]
-
-
-def generate_fingerprint(cc):
-    c = COUNTRY_PROFILES.get(cc, COUNTRY_PROFILES["US"])
-
-    if random.random() < MOBILE_PROBABILITY:
-        m = weighted(MOBILE_PROFILES)
-        fp = {
-            "device": "mobile", "browser": "chrome", "os_kind": "android",
-            "ua": m["ua"], "platform": m["platform"], "ua_platform": m["platform"],
-            "platform_version": m["platform_version"], "arch": m["arch"],
-            "model": m["model"], "mobile": True,
-            "brands": CHROME_BRANDS, "browser_full": CHROME_FULL,
-            "webgl_vendor": m["webgl_vendor"], "webgl_renderer": m["webgl_renderer"],
-            "dpr": m["dpr"], "cores": random.choice([6, 8]), "mem": random.choice([4, 6, 8]),
-            "locale": random.choice(c["locales"]), "timezone": random.choice(c["tzs"]),
-            "vw": m["vw"], "vh": m["vh"], "win": (520, 940), "screen": (m["vw"], m["vh"]),
-            "chrome_h": 0, "border_w": 0, "taskbar": 0, "avail_top": 0,
-            "pos": (0, 0), "touch": 5, "voices": VOICES_LINUX, "hint": "slight",
-        }
     else:
-        o = weighted(DESKTOP_PROFILES)
-        kind = o["os_kind"]
-        oc = OS_CHROME[kind]
-        win = random.choice(DESKTOP_WINDOWS)
-        scr = random.choice(
-            [s for s in DESKTOP_SCREENS if s[0] >= win[0] and s[1] >= win[1]] or DESKTOP_SCREENS
+        ua = UA_TEMPLATES[BROWSER_KIND].format(
+            plat=ua_plat, major=major, build=build, patch=patch,
         )
-        border_w = random.randint(*oc["border_w"])
-        max_x = max(0, scr[0] - (win[0] + border_w) - 10)
-        pos = (random.randint(0, max(0, min(160, max_x))), random.randint(0, 90))
-        fp = {
-            "device": "desktop", "browser": o["browser"], "os_kind": kind,
-            "ua": o["ua"], "platform": o["platform"], "ua_platform": o["ua_platform"],
-            "platform_version": random.choice(o["platform_versions"]), "arch": o["arch"],
-            "model": "", "mobile": False,
-            "brands": EDGE_BRANDS if o["browser"] == "edge" else CHROME_BRANDS,
-            "browser_full": (EDGE_FULL or CHROME_FULL) if o["browser"] == "edge" else CHROME_FULL,
-            "webgl_vendor": o["webgl_vendor"], "webgl_renderer": o["webgl_renderer"],
-            "dpr": random.choice(o["dpr"]), "cores": random.choice(o["cores"]),
-            "mem": random.choice(o["mem"]),
-            "locale": random.choice(c["locales"]), "timezone": random.choice(c["tzs"]),
-            "vw": win[0], "vh": win[1], "win": win, "screen": scr,
-            "chrome_h": random.randint(*oc["chrome_h"]), "border_w": border_w,
-            "taskbar": oc["taskbar"], "avail_top": oc["avail_top"], "pos": pos, "touch": 0,
-            "voices": {"windows": VOICES_WIN, "macos": VOICES_MAC}.get(kind, VOICES_LINUX),
-            "hint": oc["hint"],
-        }
 
-    fp["seed"] = stable_seed(fp["ua"], fp["screen"], fp["timezone"], fp["dpr"], fp["cores"])
-    return fp
+    full_version = f"{major}.0.{build}.{patch}"
+
+    brand_list = [
+        {"brand": "Not.A/Brand", "version": "8"},
+        {"brand": "Chromium", "version": str(major)},
+        {"brand": BRAND, "version": str(major)},
+    ]
+
+    w, h, border = rnd.choice(SCREENS)
+    taskbar = rnd.choice([0, 0, 0, 40, 48])
+    chrome_h = rnd.choice([78, 84, 88, 92, 96])
+
+    lang, tz = ("en-US", "America/New_York") if rnd.random() < 0.7 else ("en-GB", "Europe/London")
+    gpu = rnd.choice(WEBGL_PAIRS)
+
+    return {
+        "seed": seed,
+        "platform": plat,
+        "ua": ua,
+        "full_version": full_version,
+        "major": major,
+        "brand": BRAND,
+        "brand_list": brand_list,
+        "languages": [lang, lang.split("-")[0]],
+        "language": lang,
+        "timezone": tz,
+        "cores": rnd.choice([4, 8, 8, 12, 16]),
+        "memory": rnd.choice([8, 8, 16, 16, 32]),
+        "touch": rnd.choice([0, 0, 0, 1, 10]),
+        "screen_w": w,
+        "screen_h": h,
+        "avail_h": h - taskbar,
+        "border_w": border,
+        "chrome_h": chrome_h,
+        "gpu_vendor": gpu[0],
+        "gpu_renderer": gpu[1],
+        "color_depth": 24,
+        "voices": VOICE_SETS.get("US" if lang == "en-US" else "GB", VOICE_SETS["US"]),
+        "profile": f"id-{seed % IDENTITY_COUNT}",
+    }
 
 
-def identity_dir(idx):
-    return os.path.join(PROFILE_ROOT, f"id{idx}")
-
-
-def build_fingerprint(cc, identity):
-    if identity:
-        fp_file = os.path.join(identity_dir(identity), "fp.json")
-        if os.path.exists(fp_file):
-            try:
-                saved = json.load(open(fp_file))
-                if saved.get("country") == cc or random.random() < 0.5:
-                    return saved["fp"]
-            except Exception:
-                pass
-        fp = generate_fingerprint(cc)
-        try:
-            os.makedirs(identity_dir(identity), exist_ok=True)
-            json.dump({"fp": fp, "country": cc}, open(fp_file, "w"))
-        except Exception:
-            pass
-        return fp
-    return generate_fingerprint(cc)
-
+# =================================================================== JS PATCH
 
 JS_PATCH = r"""
 (() => {
-  const def = (o, p, v) => { try { Object.defineProperty(o, p, {get: () => v, configurable: true}); } catch(e){} };
-  const SEED = %SEED%;
-  const rnd = (function(a){ return function(){ a|=0; a=a+0x6D2B79F5|0;
-    let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t;
-    return ((t^t>>>14)>>>0)/4294967296; }; })(SEED);
+  const FP = __FP__;
+  const def = (o, p, v) => { try { Object.defineProperty(o, p, { get: () => v, configurable: true }); } catch (e) {} };
 
-  def(navigator, 'webdriver', false);
-  def(navigator, 'hardwareConcurrency', %CORES%);
-  def(navigator, 'deviceMemory', %MEM%);
-  def(navigator, 'platform', '%PLATFORM%');
-  def(navigator, 'language', '%LANG%');
-  def(navigator, 'languages', %LANGS%);
-  def(navigator, 'maxTouchPoints', %TOUCH%);
+  try { Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => false, configurable: true }); } catch (e) {}
+
+  def(navigator, 'platform', FP.platform);
+  def(navigator, 'vendor', 'Google Inc.');
+  def(navigator, 'hardwareConcurrency', FP.cores);
+  def(navigator, 'deviceMemory', FP.memory);
+  def(navigator, 'maxTouchPoints', FP.touch);
   def(navigator, 'pdfViewerEnabled', true);
+  def(navigator, 'languages', FP.languages);
+  def(navigator, 'language', FP.language);
+  def(navigator, 'doNotTrack', null);
+  def(navigator, 'onLine', true);
+  def(navigator, 'cookieEnabled', true);
 
-  const iw = window.innerWidth, ih = window.innerHeight;
-  def(window, 'outerWidth', iw + %BORDERW%);
-  def(window, 'outerHeight', ih + %CHROMEH%);
-  def(window, 'screenX', %POSX%);
-  def(window, 'screenY', %POSY%);
-  def(window, 'screenLeft', %POSX%);
-  def(window, 'screenTop', %POSY%);
+  const pluginNames = [
+    ['PDF Viewer', 'internal-pdf-viewer'],
+    ['Chrome PDF Viewer', 'internal-pdf-viewer'],
+    ['Chromium PDF Viewer', 'internal-pdf-viewer'],
+    ['Microsoft Edge PDF Viewer', 'internal-pdf-viewer'],
+    ['WebKit built-in PDF', 'internal-pdf-viewer'],
+  ];
+  const mkPlugin = (name, file) => {
+    const p = Object.create(Plugin.prototype);
+    def(p, 'name', name); def(p, 'filename', file);
+    def(p, 'description', 'Portable Document Format'); def(p, 'length', 1);
+    return p;
+  };
+  const plugins = pluginNames.map(([n, f]) => mkPlugin(n, f));
+  def(plugins, 'length', plugins.length);
+  const mkMime = (type) => {
+    const m = Object.create(MimeType.prototype);
+    def(m, 'type', type); def(m, 'suffixes', 'pdf'); def(m, 'description', 'Portable Document Format');
+    return m;
+  };
+  const mimes = [mkMime('application/pdf'), mkMime('text/pdf'), mkMime('application/x-google-chrome-pdf')];
+  def(mimes, 'length', mimes.length);
+  def(navigator, 'plugins', plugins);
+  def(navigator, 'mimeTypes', mimes);
+
+  if (!window.chrome) { window.chrome = {}; }
+  if (!window.chrome.runtime) {
+    window.chrome.runtime = { id: undefined, connect: function () {}, sendMessage: function () {},
+                              onMessage: { addListener: function () {} } };
+  }
+  window.chrome.app = {
+    isInstalled: false,
+    InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+    RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
+    getDetails: function () { return null; },
+    getIsInstalled: function () { return false; },
+  };
+  window.chrome.csi = function () {
+    return { onloadT: performance.timing.domContentLoadedEventEnd,
+             startE: performance.timing.navigationStart,
+             pageT: performance.now(), tran: 15 };
+  };
+  window.chrome.loadTimes = function () {
+    const t = performance.timing;
+    return { requestTime: t.navigationStart / 1000, startLoadTime: t.navigationStart / 1000,
+             commitLoadTime: t.responseStart / 1000,
+             finishDocumentLoadTime: t.domContentLoadedEventEnd / 1000,
+             finishLoadTime: t.loadEventEnd / 1000,
+             firstPaintTime: (t.domContentLoadedEventEnd + 5) / 1000,
+             firstPaintAfterLoadTime: 0, navigationType: 'Other',
+             wasFetchedViaSpdy: true, wasNpnNegotiated: true,
+             npnNegotiatedProtocol: 'h2', wasAlternateProtocolAvailable: false, connectionInfo: 'h2' };
+  };
+
+  const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+  if (origQuery) {
+    window.navigator.permissions.query = function (p) {
+      if (p && p.name === 'notifications') {
+        return Promise.resolve({ state: Notification.permission, onchange: null });
+      }
+      return origQuery.call(this, p);
+    };
+  }
 
   const s = window.screen;
-  def(s, 'availTop', %AVAILTOP%);
+  def(s, 'width', FP.screen_w);
+  def(s, 'height', FP.screen_h);
+  def(s, 'availWidth', FP.screen_w);
+  def(s, 'availHeight', FP.avail_h);
+  def(s, 'availTop', 0);
   def(s, 'availLeft', 0);
-  def(s, 'availWidth', s.width);
-  def(s, 'availHeight', Math.max(1, s.height - %TASKBAR%));
+  def(s, 'colorDepth', 24);
+  def(s, 'pixelDepth', 24);
+  def(s, 'orientation', { angle: 0, type: 'landscape-primary', onchange: null });
 
-  try {
-    if (!window.chrome) window.chrome = {};
-    if (!window.chrome.runtime) window.chrome.runtime = {};
-    if (!window.chrome.app) window.chrome.app = {isInstalled:false, InstallState:{DISABLED:'disabled'}, RunningState:{RUNNING:'running'}};
-    if (!window.chrome.csi) window.chrome.csi = () => ({startE: performance.now()-1200, onloadT: performance.now()-400, pageT: 900, tran: 15});
-    if (!window.chrome.loadTimes) window.chrome.loadTimes = () => ({
-      requestTime: (performance.now()-1400)/1000, startLoadTime: (performance.now()-1300)/1000,
-      commitLoadTime: (performance.now()-1100)/1000, finishDocumentLoadTime: (performance.now()-500)/1000,
-      finishLoadTime: (performance.now()-400)/1000, firstPaintTime: (performance.now()-900)/1000,
-      firstPaintAfterLoadTime: 0, navigationType: 'Other', wasFetchedViaSpdy: true,
-      wasNpnNegotiated: true, npnProtocol: 'h2', wasAlternateProtocolAvailable: false, connectionInfo: 'h2'
-    });
-  } catch(e){}
+  const outerW = FP.screen_w;
+  const outerH = FP.screen_h - FP.chrome_h;
+  const innerW = outerW - FP.border_w * 2;
+  def(window, 'outerWidth', outerW);
+  def(window, 'outerHeight', outerH);
+  def(window, 'innerWidth', innerW);
+  def(window, 'screenX', 0);
+  def(window, 'screenY', 0);
+  def(window, 'screenLeft', 0);
+  def(window, 'screenTop', 0);
+  def(window, 'devicePixelRatio', 1);
+  def(window, 'isSecureContext', true);
 
-  try { Object.defineProperty(Notification, 'permission', {get: () => 'default', configurable: true}); } catch(e){}
-  try {
-    const q = navigator.permissions.query.bind(navigator.permissions);
-    navigator.permissions.query = (p) => (p && p.name === 'notifications')
-      ? Promise.resolve({state: Notification.permission, onchange: null}) : q(p);
-  } catch(e){}
-
-  try {
-    const LIMITS = {3379: 16384, 34024: 16384, 34076: 16384, 34930: 16, 35660: 16,
-                    35661: 32, 36349: 1024, 36347: 4096, 36348: 30, 3386: [32767, 32767]};
-    const EXTS = ["ANGLE_instanced_arrays","EXT_blend_minmax","EXT_color_buffer_half_float",
-      "EXT_disjoint_timer_query","EXT_float_blend","EXT_frag_depth","EXT_shader_texture_lod",
-      "EXT_texture_compression_bptc","EXT_texture_compression_rgtc","EXT_texture_filter_anisotropic",
-      "WEBGL_color_buffer_float","WEBGL_compressed_texture_s3tc","WEBGL_compressed_texture_s3tc_srgb",
-      "WEBGL_debug_renderer_info","WEBGL_debug_shaders","WEBGL_depth_texture","WEBGL_draw_buffers",
-      "WEBGL_lose_context","WEBGL_multi_draw"];
-    const patch = (P) => {
-      const gp = P.getParameter;
-      P.getParameter = function(p) {
-        if (p === 37445) return '%WGLV%';
-        if (p === 37446) return '%WGLR%';
-        if (LIMITS[p] !== undefined) return LIMITS[p];
-        return gp.call(this, p);
-      };
-      P.getSupportedExtensions = function(){ return EXTS.slice(); };
-      P.getShaderPrecisionFormat = function(){ return {rangeMin: 127, rangeMax: 127, precision: 23}; };
+  const patchGL = (proto) => {
+    if (!proto) return;
+    const gp = proto.getParameter;
+    proto.getParameter = function (p) {
+      if (p === 37445) return FP.gpu_vendor;
+      if (p === 37446) return FP.gpu_renderer;
+      if (p === 3379) return 16384;
+      if (p === 34076) return 16384;
+      if (p === 34930) return 16;
+      if (p === 35660) return 16;
+      if (p === 35661) return 32;
+      if (p === 36347) return 1024;
+      if (p === 36348) return 32;
+      if (p === 36349) return 1024;
+      return gp.call(this, p);
     };
-    patch(WebGLRenderingContext.prototype);
-    if (window.WebGL2RenderingContext) patch(WebGL2RenderingContext.prototype);
-  } catch(e){}
-
-  try {
-    const gid = CanvasRenderingContext2D.prototype.getImageData;
-    CanvasRenderingContext2D.prototype.getImageData = function(){
-      const d = gid.apply(this, arguments);
-      const n = Math.min(d.data.length, 12000);
-      for (let i = 0; i < n; i += 4) if (rnd() < 0.05) d.data[i] = (d.data[i] + 1) & 255;
-      return d;
+    const ge = proto.getSupportedExtensions;
+    proto.getSupportedExtensions = function () {
+      const base = ge.call(this) || [];
+      const extra = ['WEBGL_debug_renderer_info', 'EXT_texture_filter_anisotropic',
+                     'WEBGL_compressed_texture_s3tc', 'WEBGL_compressed_texture_etc'];
+      return Array.from(new Set(base.concat(extra)));
     };
-  } catch(e){}
-  try {
-    const tdu = HTMLCanvasElement.prototype.toDataURL;
-    HTMLCanvasElement.prototype.toDataURL = function(){
+  };
+  patchGL(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+  patchGL(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+
+  const noiseSeed = FP.seed % 997;
+  const jitter = (v, i) => v + ((noiseSeed * (i + 1)) % 3) - 1;
+
+  const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+  HTMLCanvasElement.prototype.toDataURL = function () {
+    const ctx = this.getContext && this.getContext('2d');
+    if (ctx && this.width && this.height) {
       try {
-        const c = document.createElement('canvas');
-        c.width = this.width; c.height = this.height;
-        const ctx = c.getContext('2d');
-        ctx.drawImage(this, 0, 0);
-        const im = ctx.getImageData(0, 0, c.width, c.height);
-        const n = Math.min(im.data.length, 12000);
-        for (let i = 0; i < n; i += 4) if (rnd() < 0.05) im.data[i] = (im.data[i] + 1) & 255;
-        ctx.putImageData(im, 0, 0);
-        return tdu.apply(c, arguments);
-      } catch(err) { return tdu.apply(this, arguments); }
-    };
-  } catch(e){}
-
-  try {
-    if (window.OfflineAudioContext) {
-      const sr = OfflineAudioContext.prototype.startRendering;
-      OfflineAudioContext.prototype.startRendering = function(){
-        return sr.call(this).then(function(buf){
-          try {
-            const ch = buf.getChannelData(0);
-            for (let i = 0; i < ch.length; i += 40) ch[i] += (rnd() - 0.5) * 2e-6;
-          } catch(e){}
-          return buf;
-        });
-      };
+        const d = ctx.getImageData(0, 0, Math.min(this.width, 16), Math.min(this.height, 16));
+        for (let i = 0; i < d.data.length; i += 4) {
+          d.data[i] = jitter(d.data[i], i);
+          d.data[i + 1] = jitter(d.data[i + 1], i);
+          d.data[i + 2] = jitter(d.data[i + 2], i);
+        }
+        ctx.putImageData(d, 0, 0);
+      } catch (e) {}
     }
-  } catch(e){}
+    return origToDataURL.apply(this, arguments);
+  };
 
-  try {
-    const V = %VOICES%;
-    if (window.speechSynthesis) window.speechSynthesis.getVoices = () => V;
-  } catch(e){}
+  const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+  CanvasRenderingContext2D.prototype.getImageData = function () {
+    const d = origGetImageData.apply(this, arguments);
+    for (let i = 0; i < d.data.length; i += 4) { d.data[i] = jitter(d.data[i], i); }
+    return d;
+  };
 
-  try { if (!navigator.connection) def(navigator, 'connection', {effectiveType:'4g', rtt:50, downlink:10, saveData:false, type:'wifi'}); } catch(e){}
+  const oc = (window.OfflineAudioContext || window.webkitOfflineAudioContext || {}).prototype;
+  if (oc && oc.startRendering) {
+    const osr = oc.startRendering;
+    oc.startRendering = function () {
+      return osr.apply(this, arguments).then((buf) => {
+        try {
+          for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+            const data = buf.getChannelData(ch);
+            for (let i = 0; i < data.length; i += 1000) { data[i] += (noiseSeed % 7) / 1e7; }
+          }
+        } catch (e) {}
+        return buf;
+      });
+    };
+  }
+
+  if (window.speechSynthesis) {
+    const voices = FP.voices.map(v => ({
+      voiceURI: v[0], name: v[0], lang: v[1], localService: v[2], default: v[3],
+    }));
+    speechSynthesis.getVoices = function () { return voices; };
+  }
 })();
 """
 
 
-def create_driver(proxy, fp, profile_dir=None):
-    mobile = fp["device"] == "mobile"
-    SESSION["mobile"] = mobile
+def build_patch(fp):
+    return JS_PATCH.replace("__FP__", json.dumps({
+        "seed": fp["seed"], "platform": fp["platform"], "cores": fp["cores"],
+        "memory": fp["memory"], "touch": fp["touch"], "languages": fp["languages"],
+        "language": fp["language"], "screen_w": fp["screen_w"], "screen_h": fp["screen_h"],
+        "avail_h": fp["avail_h"], "border_w": fp["border_w"], "chrome_h": fp["chrome_h"],
+        "gpu_vendor": fp["gpu_vendor"], "gpu_renderer": fp["gpu_renderer"], "voices": fp["voices"],
+    }))
 
-    feats = ["CalculateNativeWinOcclusion"]
-    if fp["os_kind"] != "macos":
-        feats.append("OverlayScrollbar")
+
+# ================================================================= JS RETRY HELP
+
+def js(driver, script, *args, default=None, tries=3):
+    for attempt in range(tries):
+        if STOP:
+            return default
+        try:
+            return driver.execute_script(script, *args)
+        except Exception as e:
+            msg = str(e).lower()
+            if any(k in msg for k in ("execution context", "detached", "timeout", "not attached")):
+                time.sleep(0.5 + attempt * 0.7)
+                continue
+            return default
+    return default
+
+
+# ================================================================ NETWORK ROUTE
+
+def current_ip(timeout=12):
+    try:
+        r = requests.get("https://api.ipify.org?format=json", timeout=timeout)
+        return r.json().get("ip", "")
+    except Exception:
+        return ""
+
+
+def ip_country(ip, timeout=8):
+    if not ip:
+        return ""
+    try:
+        r = requests.get(f"http://ip-api.com/json/{ip}?fields=status,countryCode", timeout=timeout)
+        d = r.json()
+        if d.get("status") == "success":
+            return d.get("countryCode", "")
+    except Exception:
+        pass
+    return ""
+
+
+def fetch_vpngate(countries):
+    out = []
+    try:
+        r = requests.get(
+            "https://www.vpngate.net/api/iphone/",
+            auth=("vpn", "vpn"), timeout=30,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        r.raise_for_status()
+        text = r.text
+    except Exception as e:
+        log(f"[!] VPN Gate fetch failed: {e}")
+        return out
+
+    for line in text.splitlines():
+        if not line or line.startswith("*") or line.startswith("#"):
+            continue
+        parts = line.split(",")
+        if len(parts) < 15:
+            continue
+        cc = parts[6].strip().upper()
+        if countries and cc not in countries:
+            continue
+        try:
+            score = int(parts[2])
+        except Exception:
+            score = 0
+        try:
+            cfg = base64.b64decode(parts[14]).decode("utf-8", "ignore")
+        except Exception:
+            continue
+        out.append((cc, parts[1], score, cfg))
+
+    out.sort(key=lambda t: t[2], reverse=True)
+    log(f"[*] VPN Gate: {len(out)} unique {('/'.join(countries) or 'any')} servers")
+    return out
+
+
+def vpn_connect(countries=VPN_COUNTRIES):
+    """
+    Keeps comp-lzo and proto from the upstream config; strips only
+    auth-user-pass and verb so the compression framing stays intact.
+    """
+    servers = fetch_vpngate(countries)
+    if not servers:
+        return False
+
+    for cc, ip, score, raw in servers[:5]:
+        if time_left() < 90:
+            break
+
+        cfg_path = os.path.join(TMP, "vg.ovpn")
+        lines = []
+        for ln in raw.splitlines():
+            s = ln.strip()
+            if s.startswith("auth-user-pass") or s.startswith("verb "):
+                continue
+            lines.append(ln)
+        if not any(l.strip().startswith("comp-lzo") for l in lines):
+            lines.append("comp-lzo")
+        if not any(l.strip().startswith("allow-compression") for l in lines):
+            lines.append("allow-compression yes")
+
+        with open(cfg_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+        log_path = os.path.join(TMP, "openvpn.log")
+        try:
+            subprocess.Popen(
+                ["sudo", "openvpn", "--config", cfg_path, "--log", log_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            log(f"[!] openvpn spawn failed: {e}")
+            continue
+
+        ok = False
+        for _ in range(14):
+            time.sleep(1.5)
+            ip_now = current_ip(timeout=5)
+            if ip_now and ip_now != ROUTE_USED["runner_ip"]:
+                cc_now = ip_country(ip_now)
+                if cc_now:
+                    ROUTE_USED.update(ip=ip_now, country=cc_now)
+                    VPN_STATE.update(ok=True, server=ip, country=cc_now)
+                    log(f"[+] VPN up {cc}/{ip} -> exit {ip_now} ({cc_now})")
+                    ok = True
+                    break
+
+        if ok:
+            return True
+
+        log(f"[!] VPN attempt failed for {cc}/{ip}; tail:")
+        try:
+            with open(log_path) as f:
+                for t in f.readlines()[-10:]:
+                    log("    " + t.rstrip())
+        except Exception:
+            pass
+
+        subprocess.run(["sudo", "pkill", "-f", "openvpn"], timeout=12)
+        time.sleep(1.5)
+
+    return False
+
+
+class ProxyPool:
+    def __init__(self):
+        self.items = []
+        self.checked = {}
+
+    def load(self):
+        srcs = [
+            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+            "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+        ]
+        seen = set()
+        for url in srcs:
+            try:
+                r = requests.get(url, timeout=20)
+                for ln in r.text.splitlines():
+                    ln = ln.strip()
+                    if ln and ":" in ln and re.match(r"^\d{1,3}(\.\d{1,3}){3}:", ln) and ln not in seen:
+                        seen.add(ln)
+                        self.items.append(ln)
+            except Exception:
+                continue
+        random.shuffle(self.items)
+        log(f"[*] Proxy pool: {len(self.items)} candidates")
+
+    def check(self, proxy):
+        if proxy in self.checked:
+            return self.checked[proxy]
+        try:
+            r = requests.get("http://ip-api.com/json/?fields=status,countryCode,query",
+                             proxies={"http": f"http://{proxy}", "https": f"http://{proxy}"},
+                             timeout=7)
+            d = r.json()
+            res = (d.get("countryCode", ""), d.get("query", "")) if d.get("status") == "success" else None
+        except Exception:
+            res = None
+        self.checked[proxy] = res
+        return res
+
+    def next(self, prefer=("US", "GB", "UK"), max_tries=20):
+        prefer = tuple(p.upper() for p in prefer)
+        fallback = None
+        for proxy in self.items[:max_tries]:
+            if time_left() < 100:
+                break
+            res = self.check(proxy)
+            if not res:
+                continue
+            cc, ip = res
+            if cc in prefer:
+                return proxy, cc, ip
+            if fallback is None:
+                fallback = (proxy, cc, ip)
+        return fallback
+
+
+# ================================================================ DRIVER BUILD
+
+def create_driver(fp, proxy=None):
+    profile = os.path.join(PROFILE_ROOT, fp["profile"])
+    os.makedirs(profile, exist_ok=True)
 
     opts = uc.ChromeOptions()
-    for arg in [
-        "--no-sandbox", "--disable-dev-shm-usage",
-        "--disable-blink-features=AutomationControlled", "--disable-infobars",
-        "--disable-extensions", "--disable-gpu",
-        "--no-first-run", "--no-default-browser-check", "--hide-crash-restore-bubble",
-        "--password-store=basic", "--use-mock-keychain",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-renderer-backgrounding",
-        "--disable-features=" + ",".join(feats),
-        "--webrtc-ip-handling-policy=disable_non_proxied_udp",
-        f"--font-render-hinting={fp.get('hint', 'none')}",
-        f"--window-size={fp['win'][0]},{fp['win'][1]}",
-        "--window-position=0,0",
-        f"--lang={fp['locale']}",
-        f"--user-agent={fp['ua']}",
-        "--disk-cache-size=104857600",
-    ]:
-        opts.add_argument(arg)
+    opts.add_argument(f"--user-data-dir={profile}")
+    opts.add_argument(f"--user-agent={fp['ua']}")
+    opts.add_argument(f"--lang={fp['language']}")
+    opts.add_argument("--window-size=%d,%d" % (fp["screen_w"], fp["screen_h"] - fp["chrome_h"]))
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--no-default-browser-check")
+    opts.add_argument("--disable-infobars")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--disable-features=OverlayScrollbar,AutomationControlled")
+    opts.add_argument("--font-render-hinting=medium")
+    opts.add_argument("--webrtc-ip-handling-policy=disable_non_proxied_udp")
+    opts.add_argument("--force-webrtc-ip-handling-policy")
+    opts.add_argument("--disable-background-networking")
+
     if proxy:
         opts.add_argument(f"--proxy-server=http://{proxy}")
 
-    kwargs = {"version_main": int(CHROME_MAJOR)}
-    if profile_dir:
-        os.makedirs(profile_dir, exist_ok=True)
-        for f in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-            try:
-                os.remove(os.path.join(profile_dir, f))
-            except OSError:
-                pass
-        kwargs["user_data_dir"] = profile_dir
-    if fp["browser"] == "edge" and EDGE_BIN:
-        kwargs["browser_executable_path"] = EDGE_BIN
-        kwargs["version_main"] = int(EDGE_MAJOR)
+    driver = uc.Chrome(
+        options=opts,
+        browser_executable_path=BROWSER_PATH,
+        version_main=BROWSER_MAJOR,
+        use_subprocess=True,
+    )
+
+    driver.set_page_load_timeout(60)
+    driver.set_script_timeout(25)
 
     try:
-        driver = uc.Chrome(options=opts, **kwargs)
-    except Exception as e:
-        print(f"[!] Launch failed ({e}); retrying with Chrome defaults")
-        kwargs.pop("browser_executable_path", None)
-        kwargs["version_main"] = int(CHROME_MAJOR)
-        driver = uc.Chrome(options=opts, **kwargs)
-
-    driver.implicitly_wait(10)
-    POINTER["x"] = random.uniform(80, 900)
-    POINTER["y"] = random.uniform(80, 500)
+        driver.execute_cdp_cmd("Network.enable", {})
+    except Exception:
+        pass
 
     try:
         driver.execute_cdp_cmd("Emulation.setUserAgentOverride", {
             "userAgent": fp["ua"],
-            "acceptLanguage": fp["locale"],
+            "acceptLanguage": fp["language"],
             "platform": fp["platform"],
             "userAgentMetadata": {
-                "brands": fp["brands"],
+                "brands": fp["brand_list"],
+                "fullVersion": fp["full_version"],
                 "fullVersionList": [
-                    {"brand": b["brand"], "version": fp["browser_full"]} for b in fp["brands"]
+                    {"brand": b["brand"], "version": fp["full_version"]} for b in fp["brand_list"]
                 ],
-                "fullVersion": fp["browser_full"],
-                "platform": fp["ua_platform"],
-                "platformVersion": fp["platform_version"],
-                "architecture": fp["arch"],
-                "model": fp["model"],
-                "mobile": fp["mobile"],
+                "platform": "Windows" if fp["platform"] == "Win32" else "macOS",
+                "platformVersion": "10.0.0" if fp["platform"] == "Win32" else "13.0.0",
+                "architecture": "x86", "model": "", "mobile": False,
             },
         })
     except Exception as e:
-        print(f"[!] UA override failed: {e}")
+        log(f"[!] UA override: {e}")
 
-    try:
-        driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": fp["timezone"]})
-        driver.execute_cdp_cmd("Emulation.setLocaleOverride", {"locale": fp["locale"]})
-    except Exception:
-        pass
-
-    try:
-        driver.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", {
-            "width": fp["vw"], "height": fp["vh"], "deviceScaleFactor": fp["dpr"],
-            "mobile": fp["mobile"],
-            "screenWidth": fp["screen"][0], "screenHeight": fp["screen"][1],
-            "screenOrientation": {
-                "type": "portraitPrimary" if mobile else "landscapePrimary", "angle": 0,
-            },
-        })
-    except Exception:
-        pass
-
-    if mobile:
+    for cmd, params in (
+        ("Emulation.setTimezoneOverride", {"timezoneId": fp["timezone"]}),
+        ("Emulation.setLocaleOverride", {"locale": fp["language"]}),
+        ("Emulation.setDeviceMetricsOverride", {
+            "width": fp["screen_w"] - fp["border_w"] * 2,
+            "height": fp["screen_h"] - fp["chrome_h"] - 90,
+            "deviceScaleFactor": 1, "mobile": False,
+        }),
+        ("Emulation.setTouchEmulationEnabled",
+         {"enabled": bool(fp["touch"]), "maxTouchPoints": fp["touch"] or 1}),
+    ):
         try:
-            driver.execute_cdp_cmd(
-                "Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 5}
-            )
+            driver.execute_cdp_cmd(cmd, params)
         except Exception:
             pass
 
-    script = (
-        JS_PATCH
-        .replace("%SEED%", str(fp["seed"]))
-        .replace("%CORES%", str(fp["cores"]))
-        .replace("%MEM%", str(fp["mem"]))
-        .replace("%PLATFORM%", fp["platform"])
-        .replace("%LANG%", fp["locale"])
-        .replace("%LANGS%", json.dumps([fp["locale"], fp["locale"].split("-")[0]]))
-        .replace("%TOUCH%", str(fp["touch"]))
-        .replace("%BORDERW%", str(fp["border_w"]))
-        .replace("%CHROMEH%", str(fp["chrome_h"]))
-        .replace("%POSX%", str(fp["pos"][0]))
-        .replace("%POSY%", str(fp["pos"][1]))
-        .replace("%AVAILTOP%", str(fp["avail_top"]))
-        .replace("%TASKBAR%", str(fp["taskbar"]))
-        .replace("%WGLV%", fp["webgl_vendor"])
-        .replace("%WGLR%", fp["webgl_renderer"])
-        .replace("%VOICES%", json.dumps(fp["voices"]))
-    )
     try:
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": script})
-    except Exception:
-        pass
-
-    try:
-        driver.execute_cdp_cmd("Runtime.disable", {})
-    except Exception:
-        pass
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": build_patch(fp)})
+    except Exception as e:
+        log(f"[!] patch inject: {e}")
 
     return driver
 
 
-def enable_adblock(driver):
+# ============================================================ INPUT PRIMITIVES
+
+def elem_point(driver, el):
     try:
-        driver.execute_cdp_cmd("Network.enable", {})
-        driver.execute_cdp_cmd("Network.setBlockedURLs", {"urls": ADBLOCK_URLS})
-        return True
+        return el.rect["x"] + el.rect["width"] / 2, el.rect["y"] + el.rect["height"] / 2
     except Exception:
-        return False
+        pass
+    return js(driver, "const r=arguments[0].getBoundingClientRect();"
+                      "return [r.left+r.width/2, r.top+r.height/2];", el, default=None)
 
 
-# ═══════════════════════════ INPUT PRIMITIVES ═══════════════════════════
-def cdp(driver, method, params):
-    try:
-        return driver.execute_cdp_cmd(method, params)
-    except Exception:
-        return None
-
-
-def viewport(driver):
-    try:
-        return driver.execute_script("return [window.innerWidth, window.innerHeight]")
-    except Exception:
-        return [1280, 720]
-
-
-def human_move(driver, tx, ty):
-    sx, sy = POINTER["x"], POINTER["y"]
-    ox, oy = tx, ty
-    if random.random() < 0.55:
-        ox = tx + random.uniform(-18, 18)
-        oy = ty + random.uniform(-14, 14)
-
-    cx = (sx + ox) / 2 + random.randint(-90, 90)
-    cy = (sy + oy) / 2 + random.randint(-90, 90)
-    steps = random.randint(10, 24)
-
+def curve_move(driver, x1, y1, x2, y2, steps=14):
     for i in range(1, steps + 1):
         t = i / steps
-        e = 1 - (1 - t) ** 2
-        x = (1 - e) ** 2 * sx + 2 * (1 - e) * e * cx + e ** 2 * ox + random.gauss(0, 0.8)
-        y = (1 - e) ** 2 * sy + 2 * (1 - e) * e * cy + e ** 2 * oy + random.gauss(0, 0.8)
-        cdp(driver, "Input.dispatchMouseEvent",
-            {"type": "mouseMoved", "x": float(x), "y": float(y), "buttons": 0})
-        if random.random() < 0.12:
-            time.sleep(random.uniform(0.03, 0.12))
-        time.sleep(random.uniform(0.006, 0.022))
-
-    if (ox, oy) != (tx, ty):
-        for i in range(1, random.randint(4, 7)):
-            f = i / 6
-            cdp(driver, "Input.dispatchMouseEvent", {
-                "type": "mouseMoved",
-                "x": float(ox + (tx - ox) * f),
-                "y": float(oy + (ty - oy) * f),
-                "buttons": 0,
-            })
-            time.sleep(random.uniform(0.008, 0.02))
-
-    POINTER["x"], POINTER["y"] = tx, ty
+        cx = x1 + (x2 - x1) * t + math.sin(t * math.pi) * random.uniform(-22, 22)
+        cy = y1 + (y2 - y1) * t + math.sin(t * math.pi) * random.uniform(-14, 14)
+        try:
+            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                "type": "mouseMoved", "x": int(cx), "y": int(cy),
+                "buttons": 0, "pointerType": "mouse"})
+        except Exception:
+            pass
+        time.sleep(random.uniform(0.005, 0.016))
 
 
-def mouse_jiggle(driver):
-    vw, vh = viewport(driver)
-    for _ in range(random.randint(2, 4)):
-        human_move(driver, random.uniform(vw * 0.15, vw * 0.85),
-                   random.uniform(vh * 0.15, vh * 0.85))
-        time.sleep(random.uniform(0.15, 0.6))
+def hover(driver, el):
+    p = elem_point(driver, el)
+    if not p:
+        return False
+    try:
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": 3, "y": 3, "buttons": 0, "pointerType": "mouse"})
+    except Exception:
+        pass
+    curve_move(driver, 3, 3, p[0], p[1])
+    time.sleep(random.uniform(0.12, 0.4))
+    return True
 
 
-def elem_point(driver, elem, jitter=True):
-    p = driver.execute_script(
-        "const r = arguments[0].getBoundingClientRect();"
-        "return {x:r.left+r.width/2, y:r.top+r.height/2, w:r.width, h:r.height};",
-        elem,
-    )
-    vw, vh = viewport(driver)
-    x, y = p["x"], p["y"]
-    if jitter:
-        x += random.uniform(-0.35, 0.35) * max(2, p["w"] / 2)
-        y += random.uniform(-0.35, 0.35) * max(2, p["h"] / 2)
-    return min(max(x, 3), vw - 4), min(max(y, 3), vh - 4)
+def click_at(driver, el):
+    p = elem_point(driver, el)
+    if not p:
+        return False
+    hover(driver, el)
+    try:
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": int(p[0]), "y": int(p[1]),
+            "button": "left", "clickCount": 1, "buttons": 1, "pointerType": "mouse"})
+        time.sleep(random.uniform(0.05, 0.12))
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": int(p[0]), "y": int(p[1]),
+            "button": "left", "clickCount": 1, "buttons": 0, "pointerType": "mouse"})
+        return True
+    except Exception:
+        try:
+            ActionChains(driver).move_to_element(el).click().perform()
+            return True
+        except Exception:
+            return False
 
 
-def human_click(driver, elem):
-    driver.execute_script(
-        "arguments[0].scrollIntoView({block:'center', behavior:'smooth'});", elem
-    )
-    time.sleep(htime(0.5, 1.4))
-    x, y = elem_point(driver, elem)
-
-    if SESSION["mobile"]:
-        cdp(driver, "Input.dispatchTouchEvent",
-            {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]})
-        time.sleep(random.uniform(0.05, 0.15))
-        cdp(driver, "Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
-    else:
-        human_move(driver, x, y)
-        time.sleep(random.uniform(0.15, 0.55))
-        ok = cdp(driver, "Input.dispatchMouseEvent", {
-            "type": "mousePressed", "x": x, "y": y,
-            "button": "left", "clickCount": 1, "buttons": 1,
-        })
-        time.sleep(random.uniform(0.04, 0.14))
-        cdp(driver, "Input.dispatchMouseEvent", {
-            "type": "mouseReleased", "x": x, "y": y,
-            "button": "left", "clickCount": 1, "buttons": 0,
-        })
-        if ok is None:
-            try:
-                ActionChains(driver).move_to_element(elem).click().perform()
-            except Exception:
-                pass
-
-    time.sleep(random.uniform(0.3, 0.9))
+def wheel(driver, dy):
+    try:
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mouseWheel", "x": random.randint(300, 900), "y": random.randint(200, 600),
+            "deltaX": random.randint(-4, 4), "deltaY": dy})
+    except Exception:
+        js(driver, f"window.scrollBy(0,{dy})")
 
 
-def scroll(driver, amount):
-    vw, vh = viewport(driver)
-    before = driver.execute_script("return window.scrollY")
-
-    if SESSION["mobile"]:
-        cdp(driver, "Input.synthesizeScrollGesture", {
-            "x": int(vw // 2), "y": int(vh // 2), "xDistance": 0,
-            "yDistance": -int(amount), "speed": random.randint(600, 1800),
-            "gestureSourceType": "touch",
-        })
-        time.sleep(random.uniform(0.3, 0.9))
-    else:
-        left = amount
-        while abs(left) > 1:
-            step = random.randint(90, 260)
-            if step > abs(left):
-                step = abs(left)
-            if left < 0:
-                step = -step
-            cdp(driver, "Input.dispatchMouseEvent", {
-                "type": "mouseWheel",
-                "x": float(vw * random.uniform(0.35, 0.65)),
-                "y": float(vh * random.uniform(0.35, 0.65)),
-                "deltaX": 0, "deltaY": float(step),
-            })
-            left -= step
-            time.sleep(random.uniform(0.03, 0.11))
-
-    after = driver.execute_script("return window.scrollY")
-    if before == after and abs(amount) > 5:
-        driver.execute_script(f"window.scrollBy(0, {amount});")
+def scroll(driver):
+    before = js(driver, "return window.scrollY", default=0) or 0
+    target = before + random.randint(180, 620)
+    steps = random.randint(3, 7)
+    for _ in range(steps):
+        wheel(driver, int((target - before) / steps) + random.randint(-25, 25))
+        time.sleep(random.uniform(0.04, 0.16))
+    time.sleep(random.uniform(0.2, 0.7))
 
 
-def scroll_burst(driver, notches=1):
-    for _ in range(max(1, notches)):
-        scroll(driver, random.randint(150, 650))
-        time.sleep(random.uniform(0.3, 0.9))
+def scroll_burst(driver, duration):
+    end = time.time() + duration
+    while time.time() < end and not STOP:
+        if random.random() < 0.28:
+            wheel(driver, -random.randint(120, 460))
+        else:
+            scroll(driver)
+        time.sleep(random.uniform(0.3, 1.4))
 
 
-def human_type_text(el, text):
-    i = 0
-    while i < len(text):
-        for _ in range(random.randint(1, 4)):
-            if i >= len(text):
-                break
-            el.send_keys(text[i])
-            i += 1
-            time.sleep(random.uniform(0.03, 0.16))
-        if random.random() < 0.18:
-            el.send_keys(random.choice("abcdefghijklmnopqrstuvwxyz"))
-            time.sleep(random.uniform(0.08, 0.30))
+def human_type(driver, el, text):
+    el.click()
+    time.sleep(random.uniform(0.12, 0.35))
+    for ch in text:
+        if random.random() < 0.04 and ch.isalpha():
+            el.send_keys(random.choice("qwertyuiopasdfghjklzxcvbnm"))
+            time.sleep(random.uniform(0.04, 0.13))
             el.send_keys(Keys.BACKSPACE)
-            time.sleep(random.uniform(0.10, 0.35))
-        time.sleep(random.uniform(0.15, 0.60))
+            time.sleep(random.uniform(0.03, 0.1))
+        el.send_keys(ch)
+        time.sleep(random.uniform(0.04, 0.15))
 
 
 def maybe_type(driver):
     try:
-        fields = [
-            e for e in driver.find_elements(
-                By.CSS_SELECTOR, "input[type='text'], input:not([type]), textarea"
-            )
-            if e.is_displayed() and e.is_enabled() and e.size["width"] > 40
-        ]
-    except Exception:
-        return
-    if not fields:
-        return
-    el = random.choice(fields)
-    human_click(driver, el)
-    time.sleep(random.uniform(0.3, 0.9))
-    human_type_text(el, random.choice(TYPE_SAMPLES))
-
-
-def maybe_copy(driver):
-    try:
-        a = ActionChains(driver)
-        a.key_down(Keys.CONTROL).send_keys("a").key_up(Keys.CONTROL)
-        a.perform()
-        time.sleep(random.uniform(0.2, 0.5))
-        a = ActionChains(driver)
-        a.key_down(Keys.CONTROL).send_keys("c").key_up(Keys.CONTROL)
-        a.perform()
-    except Exception:
-        pass
-
-
-def maybe_refresh(driver):
-    try:
-        driver.refresh()
-        time.sleep(htime(1.5, 4.0))
+        els = driver.find_elements(By.CSS_SELECTOR, "input[type=text], input[type=search], textarea")
+        els = [e for e in els if e.is_displayed()][:3]
+        if not els:
+            return
+        el = random.choice(els)
+        hover(driver, el)
+        human_type(driver, el, random.choice(["hello", "fancy text", "cool fonts", "😀", "unicode"]))
     except Exception:
         pass
 
 
 def maybe_tab_switch(driver):
     try:
-        before = driver.window_handles
-        q = random.choice(SEARCH_QUERIES).replace(" ", "+")
-        driver.execute_script("window.open(arguments[0], '_blank');",
-                              f"https://www.google.com/search?q={q}")
-        time.sleep(random.uniform(0.8, 2.0))
-        after = driver.window_handles
-        if len(after) <= len(before):
-            return
-        driver.switch_to.window(after[-1])
-        time.sleep(htime(2.0, 6.0))
-        scroll(driver, random.randint(200, 700))
-        time.sleep(random.uniform(0.8, 2.5))
-        driver.close()
-        driver.switch_to.window(before[0])
-        time.sleep(random.uniform(0.5, 1.5))
+        handles = driver.window_handles
+        if len(handles) > 1:
+            driver.switch_to.window(random.choice(handles))
+            time.sleep(random.uniform(0.3, 1.1))
+            driver.switch_to.window(handles[0])
     except Exception:
-        try:
-            driver.switch_to.window(driver.window_handles[0])
-        except Exception:
-            pass
+        pass
 
 
-# ═══════════════════════════ PAGE BEHAVIOUR ═══════════════════════════
-def dwell(driver, seconds, energy=1.0):
-    end = time.time() + seconds
-    while time.time() < end:
+def dwell(driver, lo, hi):
+    end = time.time() + random.uniform(lo, hi)
+    end = min(end, time.time() + max(2, time_left() - 20))
+    while time.time() < end and not STOP:
         r = random.random()
-        if r < 0.34:
-            scroll(driver, random.randint(200, 900))
-            time.sleep(htime(0.6, 2.2))
-        elif r < 0.48:
-            scroll(driver, -random.randint(150, 500))
-            time.sleep(htime(0.5, 1.6))
-        elif r < 0.62:
+        if r < 0.55:
+            scroll(driver)
+        elif r < 0.72:
+            scroll_burst(driver, random.uniform(2, 6))
+        elif r < 0.82:
             maybe_type(driver)
-            time.sleep(htime(0.8, 2.5))
-        elif r < 0.70:
-            maybe_copy(driver)
-            time.sleep(htime(0.6, 1.8))
-        elif r < 0.78:
+        elif r < 0.9:
             maybe_tab_switch(driver)
-        elif r < 0.86:
-            if not SESSION["mobile"]:
-                mouse_jiggle(driver)
-            time.sleep(random.uniform(0.5, 1.5))
         else:
-            time.sleep(htime(1.5, 6.0))
-
-        if random.random() < 0.15 * energy:
-            click_random_button(driver)
-        if random.random() < 0.06:
-            maybe_refresh(driver)
-
-
-CLICKABLE = ["button", "[role='button']", "input[type='button']", "input[type='submit']", "a[href]"]
+            try:
+                driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                    "type": "mouseMoved", "x": random.randint(200, 1100),
+                    "y": random.randint(150, 700), "buttons": 0, "pointerType": "mouse"})
+            except Exception:
+                pass
+        time.sleep(random.uniform(0.3, 1.5))
 
 
 def click_random_button(driver):
-    before = driver.window_handles
-    sels = CLICKABLE[:]
-    random.shuffle(sels)
-    for sel in sels:
-        try:
-            els = [
-                e for e in driver.find_elements(By.CSS_SELECTOR, sel)
-                if e.is_displayed() and e.size["height"] > 10 and e.size["width"] > 10
-            ]
-            if not els:
-                continue
-            human_click(driver, random.choice(els))
-            time.sleep(htime(0.8, 2.0))
-            after = driver.window_handles
-            if len(after) > len(before):
-                driver.switch_to.window(after[-1])
-                time.sleep(htime(2.0, 5.0))
-                if random.random() < 0.6:
-                    driver.close()
-                    driver.switch_to.window(before[0])
-            return True
-        except Exception:
-            continue
-    return False
+    try:
+        els = driver.find_elements(By.CSS_SELECTOR, "button, a.btn, [role=button]")
+        els = [e for e in els if e.is_displayed() and e.size["height"] > 12][:20]
+        if not els:
+            return
+        el = random.choice(els)
+        hover(driver, el)
+        time.sleep(random.uniform(0.15, 0.5))
+        click_at(driver, el)
+    except Exception:
+        pass
 
 
 def click_internal_link(driver):
     try:
-        cur = driver.current_url.split("#")[0]
-        links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
-    except Exception:
-        return False
-
-    random.shuffle(links)
-    for a in links[:50]:
-        try:
-            href = (a.get_attribute("href") or "").split("#")[0]
-            if not href or TARGET_HOST not in href or href == cur:
-                continue
-            before = driver.window_handles
-            human_click(driver, a)
-            time.sleep(htime(1.5, 4.0))
-            after = driver.window_handles
-            if len(after) > len(before):
-                driver.switch_to.window(after[-1])
-            if driver.current_url.split("#")[0] != cur:
-                return True
-        except Exception:
-            continue
-    return False
-
-
-AD_SELECTORS = [
-    "ins[data-ad-slot]",
-    "ins.adsbygoogle",
-    'iframe[src*="googleads"]',
-    'iframe[src*="googlesyndication"]',
-    'iframe[id*="google_ads"]',
-    "div[data-google-query-id]",
-    'div[id*="google_ads_"]',
-    'div[class*="adsbygoogle"]',
-    'div[id*="ad"]',
-    'div[class*="ad-"]',
-    'div[class*="advert"]',
-]
-
-
-def ads_available(driver):
-    for sel in AD_SELECTORS:
-        try:
-            for e in driver.find_elements(By.CSS_SELECTOR, sel):
-                if e.is_displayed() and e.size["height"] > 10 and e.size["width"] > 10:
-                    return True
-        except Exception:
-            continue
-    return False
-
-
-def click_one_ad(driver):
-    sels = AD_SELECTORS[:]
-    random.shuffle(sels)
-    for sel in sels:
-        try:
-            for elem in driver.find_elements(By.CSS_SELECTOR, sel):
-                if not elem.is_displayed():
-                    continue
-                sz = elem.size
-                if sz["height"] < 10 or sz["width"] < 10:
-                    continue
-
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
-                time.sleep(htime(1.0, 2.6))
-
-                x, y = elem_point(driver, elem)
-                if not SESSION["mobile"]:
-                    human_move(driver, x, y)
-                    time.sleep(random.uniform(0.4, 1.2))
-
-                before = driver.window_handles
-                human_click(driver, elem)
-                print(f"[+] Clicked ad via '{sel}'")
-                time.sleep(random.uniform(1.5, 3.0))
-                after = driver.window_handles
-
-                if len(after) > len(before):
-                    driver.switch_to.window(after[-1])
-                    time.sleep(htime(2.0, 5.0))
-                    if random.random() < 0.55:
-                        scroll(driver, random.randint(250, 1000))
-                    if random.random() < 0.25:
-                        time.sleep(htime(2.0, 5.0))
-                    else:
-                        time.sleep(htime(8.0, 30.0))
-                    if random.random() < 0.30:
-                        try:
-                            driver.get(random.choice(LANDING_PAGES))
-                            time.sleep(htime(5.0, 15.0))
-                            scroll(driver, random.randint(200, 700))
-                        except Exception:
-                            pass
-                    try:
-                        driver.close()
-                        driver.switch_to.window(before[0])
-                    except Exception:
-                        pass
-                else:
-                    time.sleep(htime(4.0, 12.0))
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def search_and_click(driver):
-    q = random.choice(SEARCH_QUERIES).replace(" ", "+")
-    engine = random.choice([
-        f"https://www.google.com/search?q={q}",
-        f"https://www.bing.com/search?q={q}",
-        f"https://duckduckgo.com/?q={q}",
-    ])
-    try:
-        driver.get(engine)
-        time.sleep(htime(1.8, 4.0))
-        for sel in ["button[id*='L2AGLb']", "button[aria-label*='Accept']",
-                    "button[id*='accept']", "button[class*='consent']"]:
+        good = []
+        for a in driver.find_elements(By.CSS_SELECTOR, "a[href]"):
             try:
-                for b in driver.find_elements(By.CSS_SELECTOR, sel):
-                    if b.is_displayed():
-                        human_click(driver, b)
-                        time.sleep(htime(0.8, 2.0))
-                        break
+                if DOMAIN in (a.get_attribute("href") or "") and a.is_displayed():
+                    good.append(a)
             except Exception:
-                pass
-        scroll(driver, random.randint(100, 400))
-        time.sleep(random.uniform(0.5, 1.5))
-        links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+                continue
+        if not good:
+            return
+        el = random.choice(good[:25])
+        hover(driver, el)
+        click_at(driver, el)
+        time.sleep(random.uniform(1.2, 3.0))
     except Exception:
-        return False
+        pass
 
-    random.shuffle(links)
-    for a in links[:70]:
+
+# =================================================================== ADS LOGIC
+
+def ads_available(driver, timeout=8):
+    end = time.time() + timeout
+    while time.time() < end and not STOP:
+        for sel in AD_SELECTORS:
+            try:
+                for f in driver.find_elements(By.CSS_SELECTOR, sel):
+                    if f.is_displayed() and f.size.get("height", 0) >= 40:
+                        return f
+            except Exception:
+                continue
+        time.sleep(0.8)
+    return None
+
+
+def click_one_ad(driver, frame):
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center', behavior:'smooth'});", frame)
+    except Exception:
+        pass
+    time.sleep(random.uniform(0.6, 1.5))
+
+    hover(driver, frame)
+    time.sleep(random.uniform(0.3, 1.0))
+    click_at(driver, frame)
+
+    try:
+        driver.switch_to.frame(frame)
+        time.sleep(random.uniform(0.4, 1.0))
+        inner = [e for e in driver.find_elements(By.CSS_SELECTOR, "a, div[role=button]")
+                 if e.is_displayed()][:4]
+        if inner and random.random() < 0.65:
+            click_at(driver, random.choice(inner))
+        driver.switch_to.default_content()
+    except Exception:
         try:
-            href = a.get_attribute("href") or ""
-            if TARGET_HOST in href:
-                human_click(driver, a)
-                time.sleep(htime(2.0, 4.5))
-                if TARGET_HOST in driver.current_url:
-                    print(f"[+] Landed via search: {driver.current_url}")
-                    time.sleep(htime(2.0, 4.5))
-                    return True
-                return False
-        except Exception:
-            continue
-    return False
-
-
-def pick_landing_page(exclude):
-    pool = [p for p in LANDING_PAGES if p not in exclude] or LANDING_PAGES
-    weights = [PAGE_WEIGHTS.get(p.replace("https://www.abdulsamad.shop", "") or "/", 1)
-               for p in pool]
-    return random.choices(pool, weights=weights, k=1)[0]
-
-
-def open_page(driver, url=None, arrival="random"):
-    if url is None:
-        url = pick_landing_page(set())
-
-    mode = arrival
-    if mode == "random":
-        r = random.random()
-        mode = "search" if r < 0.30 else ("referrer" if r < 0.55 else "direct")
-
-    if mode == "search" and search_and_click(driver):
-        return
-
-    if mode == "referrer":
-        try:
-            driver.get(random.choice(REFERRER_SITES))
-            time.sleep(htime(1.5, 4.0))
-            scroll(driver, random.randint(120, 400))
+            driver.switch_to.default_content()
         except Exception:
             pass
 
-    driver.get(url)
-    print(f"[+] Landed: {driver.title}")
-    time.sleep(htime(2.5, 5.5))
-
-
-# ═══════════════════════════ TRAFFIC MODEL + CLICK GATE ═══════════════════════════
-def utc_to_local_hour(h):
-    dt = datetime.now(timezone.utc).replace(hour=h, minute=0, second=0, microsecond=0)
-    return dt.astimezone(ZoneInfo(AUDIENCE_TZ)).hour
-
-
-raw = os.environ.get("TRIGGER_UTC")
-try:
-    trigger = (datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
-               if raw else datetime.now(timezone.utc))
-except Exception:
-    trigger = datetime.now(timezone.utc)
-
-day = trigger.date()
-day_key = day.isoformat()
-
-# three independent layers so no two days or months share a shape
-EPOCH = datetime(2026, 1, 1).date()
-MONTH_GROWTH = 0.02
-CLICKS_FLOOR, CLICKS_CEIL = 22, 74
-VIEWS_FLOOR, VIEWS_CEIL = 1.0, 6.5
-
-month_idx = (day.year - EPOCH.year) * 12 + (day.month - EPOCH.month)
-growth = min(1.5, (1.0 + MONTH_GROWTH) ** max(0, month_idx))
-
-m_rng = random.Random(f"month-{day.year}-{day.month:02d}")
-month_click_base = CLICKS_PER_DAY * growth * m_rng.uniform(0.78, 1.22)
-month_view_base = BASE_PAGE_VIEWS * growth * m_rng.uniform(0.85, 1.18)
-roll = m_rng.random()
-if roll < 0.22:
-    month_click_base *= m_rng.uniform(0.72, 0.88)
-elif roll > 0.78:
-    month_click_base *= m_rng.uniform(1.14, 1.38)
-
-d_rng = random.Random(f"day-{day_key}")
-DOW = [0.92, 1.03, 1.05, 1.06, 1.07, 0.97, 0.86]  # Mon..Sun
-dow = DOW[day.weekday()]
-
-clicks_today = round(month_click_base * dow * d_rng.uniform(0.80, 1.20))
-clicks_today = max(CLICKS_FLOOR, min(CLICKS_CEIL, clicks_today))
-
-views_base_today = month_view_base * dow * d_rng.uniform(0.82, 1.18)
-views_base_today = max(VIEWS_FLOOR, min(VIEWS_CEIL, views_base_today))
-
-DAY_WEIGHTS = [max(1, round(w * d_rng.uniform(0.72, 1.32))) for w in HOUR_WEIGHTS]
-shift = d_rng.choice([-2, -1, 0, 0, 0, 1, 2])
-if shift:
-    DAY_WEIGHTS = DAY_WEIGHTS[-shift:] + DAY_WEIGHTS[:-shift]
-
-scored = []
-for h in range(24):
-    w = DAY_WEIGHTS[utc_to_local_hour(h)]
-    for s in range(12):
-        scored.append((d_rng.random() ** (1.0 / w), h, s))
-scored.sort(key=lambda x: x[0], reverse=True)
-click_slots = {(h, s) for _, h, s in scored[:clicks_today]}
-
-event = os.environ.get("GITHUB_EVENT_NAME", "")
-force_click = os.environ.get("FORCE_CLICK", "").lower() == "true"
-# the slot gate always applies; manual runs only override it when explicitly forced
-should_click = force_click or ((trigger.hour, trigger.minute // 5) in click_slots)
-
-local_hour_now = trigger.astimezone(ZoneInfo(AUDIENCE_TZ)).hour
-hour_weight = DAY_WEIGHTS[local_hour_now]
-views_this_run = max(1, min(MAX_SESSIONS_PER_RUN,
-                            round(views_base_today * hour_weight / MEAN_WEIGHT)))
-
-print(f"[*] trigger={trigger.isoformat()} local_hour={local_hour_now} weight={hour_weight}")
-print(f"[*] month_idx={month_idx} growth={growth:.3f} dow={dow}")
-print(f"[*] today: clicks={clicks_today} views_base={views_base_today:.2f} "
-      f"views_this_run={views_this_run} click_run={should_click} force={force_click}")
-
-if event == "schedule":
-    jitter = random.uniform(0, 90)
-    print(f"[*] start jitter {jitter:.0f}s")
-    time.sleep(jitter)
-
-display = Display(visible=False, size=(2560, 1440))
-display.start()
-
-vpn_servers = [] if (RESIDENTIAL_PROXY and RESIDENTIAL_SHARE >= 1.0) else fetch_vpngate()
-proxy_pool = ProxyPool(fetch_country_proxies())
-log, views, clicks = [], 0, 0
-adblocked_sessions = 0
-routes_used = {}
-
-try:
-    n_sessions = max(1, min(MAX_SESSIONS_PER_RUN, views_this_run))
-    click_sess = random.randrange(n_sessions) if should_click else -1
-    ad_done = False
-    used = set()
-    ads_seen = 0
-    no_ad_pages = 0
-    print(f"[*] Sessions this run: {n_sessions} (click session: {click_sess})")
-
-    for si in range(n_sessions):
-        proxy, label, cc, cleanup = establish_route()
-        if not label:
-            print("[!] No route — ending run early")
-            break
-
-        routes_used[label.split(":")[0]] = routes_used.get(label.split(":")[0], 0) + 1
-
-        identity = (random.randint(1, IDENTITY_COUNT)
-                    if random.random() < PERSIST_PROBABILITY else None)
-        fp = build_fingerprint(cc, identity)
-        profile_dir = identity_dir(identity) if identity else None
-        use_adblock = (random.random() < ADBLOCK_PROBABILITY) and (si != click_sess)
-
-        driver = None
+    time.sleep(random.uniform(0.8, 2.0))
+    before = len(driver.window_handles)
+    time.sleep(0.8)
+    if len(driver.window_handles) > before:
         try:
-            print(f"\n[*] Session {si + 1}/{n_sessions} | {label} | "
-                  f"{fp['device']}/{fp['browser']} {fp.get('os_kind')} "
-                  f"{fp['locale']} {fp['timezone']} | "
-                  f"identity={'id' + str(identity) if identity else 'new'} | "
-                  f"adblock={use_adblock}")
+            driver.switch_to.window(driver.window_handles[-1])
+            time.sleep(random.uniform(1.5, 4))
+            scroll_burst(driver, random.uniform(2, 6))
+            time.sleep(random.uniform(1.5, 5))
+            driver.close()
+            driver.switch_to.window(driver.window_handles[0])
+        except Exception:
+            try:
+                driver.switch_to.window(driver.window_handles[0])
+            except Exception:
+                pass
+    return True
 
-            driver = create_driver(proxy, fp, profile_dir=profile_dir)
-            if use_adblock:
-                adblocked_sessions += 1
-                enable_adblock(driver)
 
-            vi = 0
-            while vi < MAX_VIEWS_PER_SESSION:
-                if vi == 0:
-                    page = pick_landing_page(used)
-                    used.add(page)
-                    open_page(driver, page, arrival="random")
-                else:
-                    if not click_internal_link(driver):
-                        open_page(driver, pick_landing_page(used), arrival="direct")
+def open_page(driver, url, allow_click=True):
+    """Click an ad iff one is rendered, otherwise just view the page."""
+    try:
+        driver.get(url)
+    except Exception as e:
+        log(f"    [!] nav issue: {str(e)[:70]}")
+        time.sleep(1.5)
+    time.sleep(random.uniform(1.5, 3.0))
 
-                vi += 1
-                views += 1
-                log.append(f"{label} -> VIEW {driver.current_url}")
+    for txt in ("Accept", "Accept all", "Got it", "OK", "Agree"):
+        try:
+            for b in driver.find_elements(By.XPATH, f"//button[contains(., '{txt}')]"):
+                if b.is_displayed():
+                    hover(driver, b)
+                    click_at(driver, b)
+                    time.sleep(0.6)
+                    break
+        except Exception:
+            pass
 
-                arch = random.choices(["bounce", "reader", "explorer"],
-                                      weights=[22, 45, 33])[0]
-                lo, hi = (MIN_DWELL_MOBILE if fp["device"] == "mobile"
-                          else MIN_DWELL_DESKTOP)
+    scroll_burst(driver, random.uniform(2, 5))
 
-                if arch == "bounce":
-                    time.sleep(htime(2.5, 13.0))
-                    if random.random() < 0.35:
-                        scroll_burst(driver, 1)
-                        time.sleep(random.uniform(0.8, 2.6))
-                    log.append(f"{label} -> BOUNCE")
-                elif arch == "explorer":
-                    dwell(driver, htime(lo, hi) * 1.25, energy=1.6)
-                    log.append(f"{label} -> EXPLORER")
-                else:
-                    dwell(driver, htime(lo, hi))
-                    log.append(f"{label} -> READER")
+    if allow_click:
+        frame = ads_available(driver, timeout=8)
+        if frame:
+            log("    [+] ad rendered -> clicking")
+            click_one_ad(driver, frame)
+            time.sleep(random.uniform(1.5, 3))
+            return "click"
 
-                # ── the rule: another page ONLY if no ad is available ──
-                has_ads = ads_available(driver)
-                log.append(f"{label} -> ads={'yes' if has_ads else 'no'}")
+    log("    [*] no ad -> viewing page")
+    dwell(driver, 8, 22)
+    if random.random() < 0.3:
+        click_random_button(driver)
+        time.sleep(random.uniform(1, 2.5))
+    if random.random() < 0.25:
+        click_internal_link(driver)
+        scroll_burst(driver, random.uniform(2, 4))
+    return "view"
 
-                if not has_ads:
-                    no_ad_pages += 1
-                    print("[*] No ad here — opening another page")
-                    continue
 
-                ads_seen += 1
-                print("[+] Ad available — staying on this page")
+# ================================================================ TRAFFIC MODEL
 
-                if should_click and si == click_sess and not ad_done:
-                    if click_one_ad(driver):
-                        clicks += 1
-                        ad_done = True
-                        log.append(f"{label} -> AD CLICK")
-                        try:
-                            driver.save_screenshot("reports/ad_click.png")
-                        except Exception:
-                            pass
-                    else:
-                        log.append(f"{label} -> ad present but click failed")
-                break
+HOUR_WEIGHTS = [
+    0.35, 0.22, 0.18, 0.16, 0.20, 0.30,
+    0.50, 0.72, 0.95, 1.15, 1.30, 1.35,
+    1.25, 1.20, 1.15, 1.10, 1.05, 1.00,
+    0.95, 0.92, 0.88, 0.78, 0.62, 0.45,
+]
 
-            if should_click and not ad_done and si == n_sessions - 1:
-                if click_one_ad(driver):
-                    clicks += 1
-                    ad_done = True
-                    log.append(f"{label} -> AD CLICK (fallback)")
+DOW_WEIGHTS = [1.00, 1.06, 1.10, 1.09, 1.04, 0.86, 0.80]  # Mon..Sun
+MONTH_GROWTH = [1.00, 1.02, 1.04, 1.06, 1.08, 1.10, 1.12, 1.14, 1.16, 1.18, 1.20, 1.22]
+HOT_MONTHS = {1, 3, 6, 8, 10, 12}
 
+
+def day_seed(dt):
+    return int(hashlib.md5(f"{dt.year}-{dt.month}-{dt.day}".encode()).hexdigest()[:8], 16)
+
+
+def slot_index(dt):
+    """5-minute slot index within the day, 0..287."""
+    return (dt.hour * 60 + dt.minute) // 5
+
+
+def traffic_model(dt):
+    rnd = random.Random(day_seed(dt))
+
+    base = 45.0
+    base *= MONTH_GROWTH[min(dt.month - 1, 11)]
+    base *= 1.12 if dt.month in HOT_MONTHS else 0.93
+    base *= DOW_WEIGHTS[dt.weekday()]
+    base *= rnd.uniform(0.82, 1.22)
+    base = max(22, min(74, base))
+
+    clicks_today = int(round(base))
+
+    slot_w = HOUR_WEIGHTS[dt.hour]
+    p = (clicks_today / 288.0) * slot_w
+    p = max(0.02, min(0.9, p))
+
+    views = max(1, int(round(VIEWS_PER_RUN * rnd.uniform(0.85, 1.35))))
+    return clicks_today, p, views
+
+
+def should_click(dt, p):
+    """
+    Deterministic per (day, slot): two runs landing in the same slot make the
+    same decision, which keeps the schedule stable and reproducible.
+    """
+    if FORCE_CLICK:
+        return True
+    rnd = random.Random(day_seed(dt) ^ slot_index(dt))
+    return rnd.random() < p
+
+
+# ======================================================================== MAIN
+
+def main():
+    now = datetime.now(timezone.utc)
+
+    if TRIGGER_UTC:
+        try:
+            h, m = TRIGGER_UTC.split(":")
+            now = now.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+        except Exception:
+            pass
+
+    log("=" * 68)
+    log(f"[*] run {RUN_NUMBER} id {RUN_ID} event {EVENT_NAME}")
+    log(f"[*] utc {now.isoformat()} slot {slot_index(now)} force_click={FORCE_CLICK}")
+    log("=" * 68)
+
+    clicks_today, p_slot, views = traffic_model(now)
+    click_now = should_click(now, p_slot)
+    log(f"[*] model: ~{clicks_today} clicks/day | slot p={p_slot:.3f} | "
+        f"views={views} | click_now={click_now}")
+
+    seed = int(hashlib.md5(f"{now.date()}-{slot_index(now)}".encode()).hexdigest()[:8], 16)
+    fp = generate_fingerprint(seed)
+    log(f"[*] identity {fp['profile']} | {fp['platform']} | {fp['screen_w']}x{fp['screen_h']}")
+
+    # ---------- route selection: 4 tiers ----------
+    proxy = None
+    residential = os.environ.get("RESIDENTIAL_PROXY", "").strip()
+    ROUTE_USED["runner_ip"] = current_ip()
+
+    if residential:
+        proxy = residential
+        ROUTE_USED.update(tier="1-residential", detail=residential)
+        log(f"[*] route tier 1: residential proxy {residential}")
+    else:
+        if vpn_connect(VPN_COUNTRIES):
+            ROUTE_USED.update(tier="2-vpn", detail=f"{VPN_STATE['country']}/{VPN_STATE['server']}")
+        else:
+            log("[!] VPN unavailable -> tier 3 free proxy")
+            try:
+                pool = ProxyPool()
+                pool.load()
+                got = pool.next()
+                if got:
+                    proxy, cc, ip = got
+                    ROUTE_USED.update(tier="3-proxy", detail=f"{cc}/{proxy}", ip=ip, country=cc)
+                    log(f"[+] proxy {proxy} -> {ip} ({cc})")
+            except Exception as e:
+                log(f"[!] proxy pool failed: {e}")
+
+    if ROUTE_USED["tier"] == "none":
+        ROUTE_USED.update(tier="4-direct", detail=ROUTE_USED["runner_ip"])
+
+    log(f"[*] route: {ROUTE_USED['tier']} ({ROUTE_USED['detail']}) | left {time_left():.0f}s")
+
+    cc = ROUTE_USED.get("country") or "US"
+    if cc in UA_LOCALES:
+        lang, tz = UA_LOCALES[cc]
+        fp["language"], fp["languages"], fp["timezone"] = lang, [lang, lang.split("-")[0]], tz
+
+    result = {"views": 0, "clicks": 0, "urls": [], "errors": []}
+    driver = None
+
+    try:
+        driver = create_driver(fp, proxy=proxy)
+
+        warm = random.choice(LANDING_URLS)
+        log(f"[*] warm-up {warm}")
+        try:
+            driver.get(warm)
+            time.sleep(random.uniform(2, 4))
+            scroll_burst(driver, random.uniform(2, 5))
+            dwell(driver, 18, 45)
         except Exception as e:
-            print(f"[!] Session error: {e}")
-            log.append(f"{label} -> SESSION FAILED ({e})")
-        finally:
-            if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-            cleanup()
+            result["errors"].append(f"warmup: {str(e)[:70]}")
 
-        if si < n_sessions - 1:
-            gap = htime(MIN_GAP, MAX_GAP)
-            print(f"[*] gap {gap:.1f}s")
-            time.sleep(gap)
+        for i in range(views):
+            if STOP or time_left() < 45:
+                log("[*] out of budget, stopping early")
+                break
+            url = random.choice(LANDING_URLS)
+            log(f"[*] view {i+1}/{views} {url} | left {time_left():.0f}s")
+            try:
+                kind = open_page(driver, url, allow_click=click_now)
+                result["views"] += 1
+                result["urls"].append(url)
+                if kind == "click":
+                    result["clicks"] += 1
+            except Exception as e:
+                result["errors"].append(f"view{i}: {str(e)[:70]}")
+                log(f"    [!] view error: {str(e)[:70]}")
 
-    ctr = (clicks / ads_seen * 100) if ads_seen else 0.0
-    with open("reports/run_log.txt", "w") as f:
-        f.write("\n".join(log))
-    with open("reports/summary.txt", "w") as f:
-        f.write(
-            f"day={day_key} local_hour={local_hour_now}\n"
-            f"month_index={month_idx} month_growth={growth:.3f}\n"
-            f"clicks_planned_today={clicks_today}\n"
-            f"views_base_today={views_base_today:.2f}\n"
-            f"page_views={views}\nad_clicks={clicks}\n"
-            f"click_run={should_click}\nforce_click={force_click}\n"
-            f"sessions={n_sessions}\n"
-            f"routes={routes_used}\n"
-            f"adblocked_sessions={adblocked_sessions}\n"
-            f"pages_with_ads={ads_seen}\npages_without_ads={no_ad_pages}\n"
-            f"session_click_rate_pct={ctr:.1f}\n"
-        )
-    print(f"\n[+] Done. views={views} clicks={clicks} "
-          f"(ads seen={ads_seen}, no-ad pages={no_ad_pages}, CTR={ctr:.1f}%)")
+            if i < views - 1 and time_left() > 55:
+                time.sleep(random.uniform(3, 9))
 
-except Exception as e:
-    print(f"[!] Critical: {e}")
-    with open("reports/error.log", "w") as f:
-        f.write(str(e))
-finally:
-    vpn_disconnect()
-    display.stop()
-    print("[*] Shutdown")
+    except Exception as e:
+        log(f"[!] fatal: {e}")
+        result["errors"].append(str(e)[:140])
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+        result.update({
+            "run": RUN_NUMBER, "utc": now.isoformat(), "slot": slot_index(now),
+            "route": ROUTE_USED, "vpn_ok": VPN_STATE["ok"], "identity": fp["profile"],
+            "click_gate": click_now, "clicks_today_model": clicks_today,
+            "seconds": round(time.time() - START_TS, 1),
+        })
+        try:
+            with open("run_summary.json", "w") as f:
+                json.dump(result, f, indent=2)
+        except Exception:
+            pass
+
+        log("=" * 68)
+        log(f"[*] done in {result['seconds']}s | views={result['views']} "
+            f"clicks={result['clicks']} route={ROUTE_USED['tier']}")
+        for e in result["errors"]:
+            log(f"    [!] {e}")
+        log("=" * 68)
+
+
+if __name__ == "__main__":
+    main()
