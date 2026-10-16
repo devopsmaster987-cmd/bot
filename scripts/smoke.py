@@ -5,7 +5,7 @@ smoke.py -- organic traffic + AdSense click bot for abdulsamad.shop
 
 Tier budgets are separate so one slow tier cannot starve the other.
 The tunnel is detected from openvpn's own log, not by polling the network.
-Google's /sorry/ interstitial and slow-loading SERPs are both handled.
+Google /sorry/ interstitials, consent pages and slow SERPs are all handled.
 """
 
 import base64
@@ -53,13 +53,12 @@ TRIGGER_UTC = os.environ.get("TRIGGER_UTC", "")
 
 VIEWS_PER_RUN    = int(os.environ.get("VIEWS_PER_RUN", "3"))
 IDENTITY_COUNT   = int(os.environ.get("IDENTITY_COUNT", "5"))
-MAX_RUN_SECONDS  = int(os.environ.get("MAX_RUN_SECONDS", "175"))
-VPN_MAX_TRIES    = int(os.environ.get("VPN_MAX_TRIES", "3"))
-VPN_BUDGET       = int(os.environ.get("VPN_BUDGET", "45"))
-PROXY_BUDGET     = int(os.environ.get("PROXY_BUDGET", "28"))
+MAX_RUN_SECONDS  = int(os.environ.get("MAX_RUN_SECONDS", "170"))
+VPN_MAX_TRIES    = int(os.environ.get("VPN_MAX_TRIES", "8"))
+VPN_BUDGET       = int(os.environ.get("VPN_BUDGET", "55"))
+PROXY_BUDGET     = int(os.environ.get("PROXY_BUDGET", "25"))
 USE_GOOGLE_ENTRY = os.environ.get("USE_GOOGLE_ENTRY", "true").lower() in ("1", "true", "yes")
 
-# VPN Gate is ~90% JP/KR. These are always forced into the pool.
 MUST_HAVE_VPN_COUNTRIES = ("JP", "KR")
 
 DEFAULT_VPN_COUNTRIES = (
@@ -758,11 +757,12 @@ def vpn_connect(countries=VPN_COUNTRIES):
     if not servers:
         return False
 
+    # Round-robin across countries so a batch of full nodes is not fatal.
     by_cc = {}
     for s in servers:
         by_cc.setdefault(s[0], []).append(s)
     spread = []
-    depth = max(1, min(6, max(len(v) for v in by_cc.values())))
+    depth = max(1, min(10, max(len(v) for v in by_cc.values())))
     for i in range(depth):
         for cc in list(by_cc.keys()):
             if len(by_cc[cc]) > i:
@@ -770,7 +770,7 @@ def vpn_connect(countries=VPN_COUNTRIES):
 
     tried = 0
     for cc, ip, score, raw in spread:
-        if tried >= VPN_MAX_TRIES or vpn_time_left() < 8:
+        if tried >= VPN_MAX_TRIES or vpn_time_left() < 6:
             break
         tried += 1
 
@@ -803,7 +803,7 @@ def vpn_connect(countries=VPN_COUNTRIES):
 
         ok = False
         why = "timeout"
-        for _ in range(38):
+        for _ in range(30):
             time.sleep(0.5)
             try:
                 with open(log_path) as f:
@@ -822,7 +822,7 @@ def vpn_connect(countries=VPN_COUNTRIES):
             if "Cannot resolve host" in txt:
                 why = "dns fail"
                 break
-            if vpn_time_left() < 6:
+            if vpn_time_left() < 5:
                 why = "budget"
                 break
 
@@ -831,13 +831,15 @@ def vpn_connect(countries=VPN_COUNTRIES):
             cc_now = ip_country(ip_now)
             ROUTE_USED.update(ip=ip_now, country=cc_now)
             VPN_STATE.update(ok=True, server=ip, country=cc_now)
-            log(f"[+] VPN up {cc}/{ip} ({proto}) -> exit {ip_now} ({cc_now})")
+            log(f"[+] VPN up {cc}/{ip} ({proto}) -> exit {ip_now} ({cc_now}) "
+                f"after {tried} tries")
             return True
 
         log(f"[!] VPN failed {cc}/{ip} ({proto}): {why}")
         subprocess.run(["sudo", "pkill", "-f", "openvpn"], timeout=5)
-        time.sleep(0.3)
+        time.sleep(0.2)
 
+    log(f"[!] VPN gave up after {tried} tries")
     return False
 
 
@@ -1286,23 +1288,30 @@ def _fast_get(driver, url, timeout=28):
     return ok
 
 
-def _serp_link_count(driver):
+def _serp_report(driver, q):
+    """Return (total_links, our_links) and log url/title for diagnosis."""
     try:
-        n = 0
-        for a in driver.find_elements(By.CSS_SELECTOR, "a[href]")[:400]:
+        url = (driver.current_url or "")[:78]
+        title = (driver.title or "")[:55]
+        links = driver.find_elements(By.CSSSelector("a[href]"))
+        ours = 0
+        for a in links[:400]:
             try:
                 if _is_our_serp_link(a.get_attribute("href") or ""):
-                    n += 1
+                    ours += 1
             except Exception:
                 continue
-        return n
+        log(f"    [*] SERP '{q}': {len(links)} links, {ours} ours")
+        log(f"        url={url}")
+        log(f"        title={title!r}")
+        return len(links), ours
     except Exception:
-        return 0
+        return 0, 0
 
 
 def _click_first_our_link(driver, q, tld):
     try:
-        for a in driver.find_elements(By.CSS_SELECTOR, "a[href]"):
+        for a in driver.find_elements(By.CSSSelector("a[href]")):
             try:
                 href = a.get_attribute("href") or ""
             except Exception:
@@ -1341,14 +1350,19 @@ def enter_via_google(driver, term=None):
         loaded = _fast_get(driver, url, timeout=28)
         if not loaded:
             log(f"    [!] google.{tld} slow for '{q}' -- parsing partial DOM")
-        time.sleep(random.uniform(1.0, 1.8))
+        time.sleep(random.uniform(1.2, 2.0))
 
         accept_google_consent(driver)
         handle_google_interstitial(driver)
         scroll_burst(driver, random.uniform(0.8, 1.6))
 
-        ours = _serp_link_count(driver)
-        log(f"    [*] SERP '{q}': {ours} of our links")
+        total, ours = _serp_report(driver, q)
+
+        if total < 8:
+            log("    [*] page looks empty -- reloading once")
+            _fast_get(driver, url, timeout=25)
+            time.sleep(random.uniform(1.5, 2.5))
+            total, ours = _serp_report(driver, q)
 
         if ours and _click_first_our_link(driver, q, tld):
             return True
@@ -1521,7 +1535,7 @@ def main():
     log(f"[*] run {RUN_NUMBER} id {RUN_ID} event {EVENT_NAME}")
     log(f"[*] utc {now.isoformat()} slot {slot_index(now)} force_click={FORCE_CLICK}")
     log(f"[*] vpn pool: {len(VPN_COUNTRIES)} countries | "
-        f"budgets vpn={VPN_BUDGET}s proxy={PROXY_BUDGET}s")
+        f"budgets vpn={VPN_BUDGET}s proxy={PROXY_BUDGET}s | max tries {VPN_MAX_TRIES}")
     if VPN_AUTOFIXED:
         log(f"[*] note: added {','.join(VPN_AUTOFIXED)} to vpn pool (env list was missing them)")
     log("=" * 68)
