@@ -3,9 +3,9 @@
 """
 smoke.py -- organic traffic + AdSense click bot for abdulsamad.shop
 
-Tier budgets are separate so one slow tier cannot starve the other.
-The tunnel is detected from openvpn's own log, not by polling the network.
-Google /sorry/ interstitials, consent pages and slow SERPs are all handled.
+Each run targets TARGET_CLICKS_PER_RUN ad clicks and TARGET_VIEWS_PER_RUN
+page views, working through pages until both targets or the time budget is
+hit. The first page of each run is entered via Google search.
 """
 
 import base64
@@ -51,15 +51,24 @@ EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "schedule")
 FORCE_CLICK = os.environ.get("FORCE_CLICK", "false").lower() in ("1", "true", "yes")
 TRIGGER_UTC = os.environ.get("TRIGGER_UTC", "")
 
-VIEWS_PER_RUN    = int(os.environ.get("VIEWS_PER_RUN", "3"))
-IDENTITY_COUNT   = int(os.environ.get("IDENTITY_COUNT", "5"))
-MAX_RUN_SECONDS  = int(os.environ.get("MAX_RUN_SECONDS", "170"))
-VPN_MAX_TRIES    = int(os.environ.get("VPN_MAX_TRIES", "8"))
-VPN_BUDGET       = int(os.environ.get("VPN_BUDGET", "55"))
-PROXY_BUDGET     = int(os.environ.get("PROXY_BUDGET", "25"))
-USE_GOOGLE_ENTRY = os.environ.get("USE_GOOGLE_ENTRY", "true").lower() in ("1", "true", "yes")
+TARGET_CLICKS_PER_RUN = int(os.environ.get("TARGET_CLICKS_PER_RUN", "10"))
+TARGET_VIEWS_PER_RUN  = int(os.environ.get("TARGET_VIEWS_PER_RUN", "12"))
+IDENTITY_COUNT        = int(os.environ.get("IDENTITY_COUNT", "5"))
+MAX_RUN_SECONDS       = int(os.environ.get("MAX_RUN_SECONDS", "600"))
+VPN_MAX_TRIES         = int(os.environ.get("VPN_MAX_TRIES", "6"))
+VPN_BUDGET            = int(os.environ.get("VPN_BUDGET", "60"))
+PROXY_BUDGET          = int(os.environ.get("PROXY_BUDGET", "30"))
+GOOGLE_CAP            = int(os.environ.get("GOOGLE_CAP", "60"))
+USE_GOOGLE_ENTRY      = os.environ.get("USE_GOOGLE_ENTRY", "true").lower() in ("1", "true", "yes")
 
 MUST_HAVE_VPN_COUNTRIES = ("JP", "KR")
+
+VPN_COUNTRY_ORDER = [
+    "US", "GB", "UK", "IE", "DE", "NL", "FR", "BE", "CH", "AT",
+    "SE", "NO", "DK", "FI", "PL", "CZ", "SK", "HU", "RO", "BG",
+    "GR", "HR", "SI", "EE", "LV", "LT", "RS", "UA", "IS", "LU",
+    "MT", "CY", "TR", "JP", "KR",
+]
 
 DEFAULT_VPN_COUNTRIES = (
     "US,GB,UK,"
@@ -130,6 +139,10 @@ ROUTE_USED = {"tier": "none", "detail": "", "ip": "", "country": "", "runner_ip"
 STOP = False
 
 
+def log(*a):
+    print(*a, flush=True)
+
+
 def _on_term(signum, frame):
     global STOP
     STOP = True
@@ -138,10 +151,6 @@ def _on_term(signum, frame):
 
 signal.signal(signal.SIGTERM, _on_term)
 signal.signal(signal.SIGINT, _on_term)
-
-
-def log(*a):
-    print(*a, flush=True)
 
 
 def time_left():
@@ -757,14 +766,17 @@ def vpn_connect(countries=VPN_COUNTRIES):
     if not servers:
         return False
 
-    # Round-robin across countries so a batch of full nodes is not fatal.
     by_cc = {}
     for s in servers:
         by_cc.setdefault(s[0], []).append(s)
+
+    order = [c for c in VPN_COUNTRY_ORDER if c in by_cc]
+    order += [c for c in by_cc if c not in order]
+
     spread = []
-    depth = max(1, min(10, max(len(v) for v in by_cc.values())))
+    depth = max(1, min(8, max(len(v) for v in by_cc.values())))
     for i in range(depth):
-        for cc in list(by_cc.keys()):
+        for cc in order:
             if len(by_cc[cc]) > i:
                 spread.append(by_cc[cc][i])
 
@@ -831,8 +843,7 @@ def vpn_connect(countries=VPN_COUNTRIES):
             cc_now = ip_country(ip_now)
             ROUTE_USED.update(ip=ip_now, country=cc_now)
             VPN_STATE.update(ok=True, server=ip, country=cc_now)
-            log(f"[+] VPN up {cc}/{ip} ({proto}) -> exit {ip_now} ({cc_now}) "
-                f"after {tried} tries")
+            log(f"[+] VPN up {cc}/{ip} ({proto}) -> exit {ip_now} ({cc_now}) after {tried} tries")
             return True
 
         log(f"[!] VPN failed {cc}/{ip} ({proto}): {why}")
@@ -875,7 +886,7 @@ class ProxyPool:
                 continue
 
         for url in bulk_srcs:
-            if proxy_time_left() < 6:
+            if proxy_time_left() < 5:
                 break
             try:
                 r = requests.get(url, timeout=6)
@@ -1103,7 +1114,8 @@ def human_type(driver, el, text):
 def maybe_type(driver):
     try:
         els = [e for e in driver.find_elements(
-            By.CSS_SELECTOR, "input[type=text], input[type=search], textarea") if e.is_displayed()][:3]
+            By.CSS_SELECTOR, "input[type=text], input[type=search], textarea")
+            if e.is_displayed()][:3]
         if not els:
             return
         el = random.choice(els)
@@ -1125,7 +1137,7 @@ def maybe_tab_switch(driver):
 
 
 def dwell(driver, lo, hi):
-    end = min(time.time() + random.uniform(lo, hi), time.time() + max(2, time_left() - 12))
+    end = min(time.time() + random.uniform(lo, hi), time.time() + max(2, time_left() - 20))
     while time.time() < end and not STOP:
         r = random.random()
         if r < 0.55:
@@ -1179,7 +1191,30 @@ def click_internal_link(driver):
         pass
 
 
-# ============================================== GOOGLE SEARCH ENTRY (GSC-VISIBLE)
+# ============================================================ NAV + GOOGLE ENTRY
+
+def _fast_get(driver, url, timeout=25):
+    """Navigate with a short timeout; on failure stop loading and parse anyway."""
+    try:
+        driver.set_page_load_timeout(timeout)
+    except Exception:
+        pass
+    ok = True
+    try:
+        driver.get(url)
+    except Exception:
+        ok = False
+        try:
+            driver.execute_script("window.stop()")
+        except Exception:
+            pass
+    finally:
+        try:
+            driver.set_page_load_timeout(40)
+        except Exception:
+            pass
+    return ok
+
 
 def accept_google_consent(driver):
     for sel in ("button#L2AGLb", "button[aria-label*='Accept']", "button[aria-label*='Agree']",
@@ -1232,12 +1267,12 @@ def handle_google_interstitial(driver):
             if not fr:
                 continue
             driver.switch_to.frame(fr[0])
-            time.sleep(random.uniform(0.6, 1.2))
+            time.sleep(random.uniform(0.5, 1.0))
             boxes = driver.find_elements(By.CSS_SELECTOR, "#recaptcha-anchor, .recaptcha-checkbox")
             if boxes:
                 click_at(driver, boxes[0])
             driver.switch_to.default_content()
-            time.sleep(random.uniform(2.5, 4.0))
+            time.sleep(random.uniform(2.0, 3.5))
             break
         except Exception:
             try:
@@ -1254,8 +1289,8 @@ def handle_google_interstitial(driver):
         if m:
             target = unquote(m.group(1))
             if target.startswith("http"):
-                _fast_get(driver, target, timeout=18)
-                time.sleep(1.5)
+                _fast_get(driver, target, timeout=16)
+                time.sleep(1.2)
                 if not _on_sorry_page(driver):
                     log("    [*] interstitial bypassed via continue=")
                     return True
@@ -1266,34 +1301,11 @@ def handle_google_interstitial(driver):
     return False
 
 
-def _fast_get(driver, url, timeout=28):
-    try:
-        driver.set_page_load_timeout(timeout)
-    except Exception:
-        pass
-    ok = True
-    try:
-        driver.get(url)
-    except Exception:
-        ok = False
-        try:
-            driver.execute_script("window.stop()")
-        except Exception:
-            pass
-    finally:
-        try:
-            driver.set_page_load_timeout(40)
-        except Exception:
-            pass
-    return ok
-
-
 def _serp_report(driver, q):
-    """Return (total_links, our_links) and log url/title for diagnosis."""
     try:
         url = (driver.current_url or "")[:78]
         title = (driver.title or "")[:55]
-        links = driver.find_elements(By.CSSSelector("a[href]"))
+        links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
         ours = 0
         for a in links[:400]:
             try:
@@ -1311,7 +1323,7 @@ def _serp_report(driver, q):
 
 def _click_first_our_link(driver, q, tld):
     try:
-        for a in driver.find_elements(By.CSSSelector("a[href]")):
+        for a in driver.find_elements(By.CSS_SELECTOR, "a[href]"):
             try:
                 href = a.get_attribute("href") or ""
             except Exception:
@@ -1332,44 +1344,41 @@ def _click_first_our_link(driver, q, tld):
 
 
 def enter_via_google(driver, term=None):
-    """Search Google, click our own organic result. Feeds Search Console."""
+    """Search Google, click our own organic result. Hard-capped in time."""
     cc = ROUTE_USED.get("country") or "US"
     tld = GOOGLE_TLD.get(cc, "com")
+    cap = min(time.time() + GOOGLE_CAP, START_TS + MAX_RUN_SECONDS - 90)
 
-    candidates = [term if term else random.choice(SEARCH_TERMS)]
-    candidates.append(random.choice(BRAND_TERMS))
+    candidates = [random.choice(BRAND_TERMS)]
+    candidates.append(term if term else random.choice(SEARCH_TERMS))
 
-    log(f"    [*] google entry attempt via google.{tld}")
+    log(f"    [*] google entry via google.{tld}")
 
-    for idx, q in enumerate(candidates):
-        if time_left() < 32:
-            log("    [!] google entry: out of budget")
+    for q in candidates:
+        if time.time() > cap:
+            log("    [!] google entry: cap reached")
             break
 
         url = f"https://www.google.{tld}/search?q={quote_plus(q)}&hl=en&num=20"
-        loaded = _fast_get(driver, url, timeout=28)
-        if not loaded:
+        if not _fast_get(driver, url, timeout=20):
             log(f"    [!] google.{tld} slow for '{q}' -- parsing partial DOM")
-        time.sleep(random.uniform(1.2, 2.0))
+        time.sleep(random.uniform(0.9, 1.6))
 
         accept_google_consent(driver)
-        handle_google_interstitial(driver)
-        scroll_burst(driver, random.uniform(0.8, 1.6))
+        if _on_sorry_page(driver):
+            handle_google_interstitial(driver)
+        scroll_burst(driver, random.uniform(0.6, 1.3))
 
         total, ours = _serp_report(driver, q)
 
-        if total < 8:
+        if total < 8 and time.time() < cap - 10:
             log("    [*] page looks empty -- reloading once")
-            _fast_get(driver, url, timeout=25)
-            time.sleep(random.uniform(1.5, 2.5))
+            _fast_get(driver, url, timeout=16)
+            time.sleep(random.uniform(1.0, 1.8))
             total, ours = _serp_report(driver, q)
 
         if ours and _click_first_our_link(driver, q, tld):
             return True
-
-        if ours == 0 and idx == 0 and time_left() < 70:
-            log("    [*] skipping 2nd query (low budget)")
-            break
 
         log(f"    [!] no SERP hit for '{q}'")
 
@@ -1378,7 +1387,7 @@ def enter_via_google(driver, term=None):
 
 # =================================================================== ADS LOGIC
 
-def ads_available(driver, timeout=6):
+def ads_available(driver, timeout=8):
     end = time.time() + timeout
     while time.time() < end and not STOP:
         for sel in AD_SELECTORS:
@@ -1393,31 +1402,40 @@ def ads_available(driver, timeout=6):
 
 
 def click_one_ad(driver, frame):
-    try:
-        driver.execute_script(
-            "arguments[0].scrollIntoView({block:'center', behavior:'smooth'});", frame)
-    except Exception:
-        pass
-    time.sleep(random.uniform(0.5, 1.2))
-
-    hover(driver, frame)
-    time.sleep(random.uniform(0.25, 0.8))
-    click_at(driver, frame)
-
-    try:
-        driver.switch_to.frame(frame)
-        time.sleep(random.uniform(0.3, 0.8))
-        inner = [e for e in driver.find_elements(By.CSS_SELECTOR, "a, div[role=button]")
-                 if e.is_displayed()][:4]
-        if inner and random.random() < 0.65:
-            click_at(driver, random.choice(inner))
-        driver.switch_to.default_content()
-    except Exception:
+    """Click the ad frame. Retries once if the frame goes stale."""
+    for attempt in range(2):
         try:
-            driver.switch_to.default_content()
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center', behavior:'smooth'});", frame)
         except Exception:
             pass
+        time.sleep(random.uniform(0.5, 1.1))
 
+        if not hover(driver, frame):
+            return False
+        time.sleep(random.uniform(0.25, 0.8))
+        if not click_at(driver, frame):
+            if attempt == 0:
+                continue
+            return False
+
+        try:
+            driver.switch_to.frame(frame)
+            time.sleep(random.uniform(0.3, 0.8))
+            inner = [e for e in driver.find_elements(By.CSS_SELECTOR, "a, div[role=button]")
+                     if e.is_displayed()][:4]
+            if inner and random.random() < 0.65:
+                click_at(driver, random.choice(inner))
+            driver.switch_to.default_content()
+        except Exception:
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+
+        break
+
+    # the ad may have opened a landing page in a new tab
     time.sleep(random.uniform(0.7, 1.6))
     before = len(driver.window_handles)
     time.sleep(0.7)
@@ -1437,17 +1455,22 @@ def click_one_ad(driver, frame):
     return True
 
 
-def money_step(driver, click_now):
-    url = random.choice(LANDING_URLS)
-    log(f"[*] MONEY STEP -> {url} | left {time_left():.0f}s | click_gate={click_now}")
+# ================================================================ PAGE VISIT
 
-    entered = False
-    if USE_GOOGLE_ENTRY:
-        entered = enter_via_google(driver)
-    if not entered:
-        log("    [*] direct nav fallback")
+def open_page(driver, url, via_google=False, allow_click=True):
+    """
+    One page visit. Returns (kind, final_url) where kind is 'click' or 'view'.
+    """
+    landed = False
+    if via_google and USE_GOOGLE_ENTRY:
+        t0 = time.time()
+        landed = enter_via_google(driver)
+        log(f"    [*] google entry took {time.time() - t0:.0f}s")
+
+    if not landed:
+        log("    [*] direct nav")
         _fast_get(driver, url, timeout=25)
-    time.sleep(random.uniform(1.0, 2.2))
+    time.sleep(random.uniform(1.0, 2.0))
 
     for txt in ("Accept", "Accept all", "Got it", "OK", "Agree"):
         try:
@@ -1462,31 +1485,30 @@ def money_step(driver, click_now):
 
     scroll_burst(driver, random.uniform(1.5, 4))
 
-    frame = ads_available(driver, timeout=6)
+    frame = ads_available(driver, timeout=8)
+    final_url = driver.current_url or url
 
-    if frame and click_now:
-        log("    [+] AD RENDERED + gate open -> clicking")
+    if frame and allow_click:
+        log("    [+] AD RENDERED -> clicking")
         click_one_ad(driver, frame)
-        time.sleep(random.uniform(1.2, 2.5))
-        return "click", url
+        time.sleep(random.uniform(1.2, 2.2))
+        return "click", final_url
 
     if frame:
-        log("    [*] ad rendered but gate closed -> viewing")
+        log("    [*] ad present, click target met -> viewing")
     else:
         log("    [*] no ad -> viewing page")
 
-    dwell(driver, 6, 15)
-    return "view", url
+    dwell(driver, 8, 22)
+    if random.random() < 0.25:
+        click_random_button(driver)
+        time.sleep(random.uniform(0.8, 2.0))
+
+    return "view", (driver.current_url or final_url)
 
 
 # ================================================================ TRAFFIC MODEL
 
-HOUR_WEIGHTS = [
-    0.35, 0.22, 0.18, 0.16, 0.20, 0.30,
-    0.50, 0.72, 0.95, 1.15, 1.30, 1.35,
-    1.25, 1.20, 1.15, 1.10, 1.05, 1.00,
-    0.95, 0.92, 0.88, 0.78, 0.62, 0.45,
-]
 DOW_WEIGHTS = [1.00, 1.06, 1.10, 1.09, 1.04, 0.86, 0.80]
 MONTH_GROWTH = [1.00, 1.02, 1.04, 1.06, 1.08, 1.10, 1.12, 1.14, 1.16, 1.18, 1.20, 1.22]
 HOT_MONTHS = {1, 3, 6, 8, 10, 12}
@@ -1500,24 +1522,17 @@ def slot_index(dt):
     return (dt.hour * 60 + dt.minute) // 5
 
 
-def traffic_model(dt):
+def daily_targets(dt):
+    """Day/month variation on how much work this run does."""
     rnd = random.Random(day_seed(dt))
-    base = 45.0
-    base *= MONTH_GROWTH[min(dt.month - 1, 11)]
-    base *= 1.12 if dt.month in HOT_MONTHS else 0.93
-    base *= DOW_WEIGHTS[dt.weekday()]
-    base *= rnd.uniform(0.82, 1.22)
-    base = max(22, min(74, base))
-    clicks_today = int(round(base))
-    p = max(0.02, min(0.9, (clicks_today / 288.0) * HOUR_WEIGHTS[dt.hour]))
-    views = max(1, int(round(VIEWS_PER_RUN * rnd.uniform(0.85, 1.35))))
-    return clicks_today, p, views
+    factor = MONTH_GROWTH[min(dt.month - 1, 11)]
+    factor *= 1.10 if dt.month in HOT_MONTHS else 0.94
+    factor *= DOW_WEIGHTS[dt.weekday()]
+    factor *= rnd.uniform(0.85, 1.20)
 
-
-def should_click(dt, p):
-    if FORCE_CLICK:
-        return True
-    return random.Random(day_seed(dt) ^ slot_index(dt)).random() < p
+    clicks = max(4, int(round(TARGET_CLICKS_PER_RUN * factor)))
+    views = max(clicks, int(round(TARGET_VIEWS_PER_RUN * factor)))
+    return clicks, views
 
 
 # ======================================================================== MAIN
@@ -1531,6 +1546,8 @@ def main():
         except Exception:
             pass
 
+    target_clicks, target_views = daily_targets(now)
+
     log("=" * 68)
     log(f"[*] run {RUN_NUMBER} id {RUN_ID} event {EVENT_NAME}")
     log(f"[*] utc {now.isoformat()} slot {slot_index(now)} force_click={FORCE_CLICK}")
@@ -1538,11 +1555,9 @@ def main():
         f"budgets vpn={VPN_BUDGET}s proxy={PROXY_BUDGET}s | max tries {VPN_MAX_TRIES}")
     if VPN_AUTOFIXED:
         log(f"[*] note: added {','.join(VPN_AUTOFIXED)} to vpn pool (env list was missing them)")
+    log(f"[*] targets this run: {target_clicks} clicks, {target_views} views, "
+        f"budget {MAX_RUN_SECONDS}s")
     log("=" * 68)
-
-    clicks_today, p_slot, views = traffic_model(now)
-    click_now = should_click(now, p_slot)
-    log(f"[*] model: ~{clicks_today} clicks/day | slot p={p_slot:.3f} | views={views} | click_now={click_now}")
 
     seed = int(hashlib.md5(f"{now.date()}-{slot_index(now)}".encode()).hexdigest()[:8], 16)
     fp = generate_fingerprint(seed)
@@ -1594,29 +1609,40 @@ def main():
 
     result = {"views": 0, "clicks": 0, "urls": [], "errors": []}
     driver = None
+    need_google_entry = True
 
     try:
         driver = create_driver(fp, proxy=proxy)
 
-        kind, url = money_step(driver, click_now)
-        result["views"] += 1
-        result["urls"].append(url)
-        if kind == "click":
-            result["clicks"] += 1
-
-        while len(result["urls"]) < views and time_left() > 35 and not STOP:
-            url = random.choice(LANDING_URLS)
-            log(f"[*] extra view -> {url} | left {time_left():.0f}s")
-            try:
-                _fast_get(driver, url, timeout=22)
-                time.sleep(random.uniform(1.0, 2.0))
-                scroll_burst(driver, random.uniform(1.5, 3.5))
-                dwell(driver, 5, 11)
-                result["views"] += 1
-                result["urls"].append(url)
-            except Exception as e:
-                result["errors"].append(f"view: {str(e)[:60]}")
+        while not STOP:
+            if result["views"] >= target_views and result["clicks"] >= target_clicks:
+                log("[*] both targets reached")
                 break
+            if time_left() < 45:
+                log("[*] out of budget")
+                break
+
+            url = random.choice(LANDING_URLS)
+            allow_click = result["clicks"] < target_clicks
+            log(f"[*] page {result['views'] + 1} -> {url} | left {time_left():.0f}s | "
+                f"clicks {result['clicks']}/{target_clicks}")
+
+            attempted_google = need_google_entry
+            try:
+                kind, final_url = open_page(driver, url, via_google=need_google_entry,
+                                            allow_click=allow_click)
+                if attempted_google:
+                    need_google_entry = False
+                result["views"] += 1
+                result["urls"].append(final_url)
+                if kind == "click":
+                    result["clicks"] += 1
+            except Exception as e:
+                result["errors"].append(f"page: {str(e)[:60]}")
+                log(f"    [!] page error: {str(e)[:60]}")
+
+            if time_left() > 60:
+                time.sleep(random.uniform(6, 20))
 
     except Exception as e:
         log(f"[!] fatal: {e}")
@@ -1625,8 +1651,8 @@ def main():
         result.update({
             "run": RUN_NUMBER, "utc": now.isoformat(), "slot": slot_index(now),
             "route": ROUTE_USED, "vpn_ok": VPN_STATE["ok"], "identity": fp["profile"],
-            "locale": fp["language"], "click_gate": click_now,
-            "clicks_today_model": clicks_today,
+            "locale": fp["language"],
+            "target_clicks": target_clicks, "target_views": target_views,
             "seconds": round(time.time() - START_TS, 1),
         })
         try:
@@ -1636,8 +1662,8 @@ def main():
             pass
 
         log("=" * 68)
-        log(f"[*] done in {result['seconds']}s | views={result['views']} "
-            f"clicks={result['clicks']} route={ROUTE_USED['tier']}")
+        log(f"[*] done in {result['seconds']}s | views={result['views']}/{target_views} "
+            f"clicks={result['clicks']}/{target_clicks} route={ROUTE_USED['tier']}")
         for e in result["errors"]:
             log(f"    [!] {e}")
         log("=" * 68)

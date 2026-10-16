@@ -47,12 +47,15 @@ jobs:
 
     env:
       SITE: 'https://www.abdulsamad.shop'
-      VIEWS_PER_RUN: '3'
-      CLICKS_PER_DAY_TARGET: '45'
+      TARGET_CLICKS_PER_RUN: '10'
+      TARGET_VIEWS_PER_RUN: '12'
       IDENTITY_COUNT: '5'
-      VPN_COUNTRIES: 'US,GB,UK,DE,FR,NL,SE,CH,AT,BE,IT,ES,PL,CZ,RO,HU,FI,NO,DK,IE,PT,GR,TR'
-      MAX_RUN_SECONDS: '200'
-      VPN_MAX_TRIES: '3'
+      VPN_COUNTRIES: 'US,GB,UK,DE,FR,NL,SE,CH,AT,BE,IT,ES,PL,CZ,RO,HU,FI,NO,DK,IE,PT,GR,TR,JP,KR'
+      MAX_RUN_SECONDS: '700'
+      VPN_MAX_TRIES: '6'
+      VPN_BUDGET: '60'
+      PROXY_BUDGET: '30'
+      GOOGLE_CAP: '60'
       USE_GOOGLE_ENTRY: 'true'
       FORCE_CLICK: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_click || 'false' }}
       TRIGGER_UTC: ${{ github.event.schedule || '' }}
