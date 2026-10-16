@@ -3,9 +3,9 @@
 """
 smoke.py -- organic traffic + AdSense click bot for abdulsamad.shop
 
-Tier budgets are separate (VPN then proxy) so one slow tier cannot starve
-the other. The openvpn tunnel is detected by tailing its own log, not by
-polling the network. Google's /sorry/ interstitial is detected and handled.
+Tier budgets are separate so one slow tier cannot starve the other.
+The tunnel is detected from openvpn's own log, not by polling the network.
+Google's /sorry/ interstitial and slow-loading SERPs are both handled.
 """
 
 import base64
@@ -54,10 +54,13 @@ TRIGGER_UTC = os.environ.get("TRIGGER_UTC", "")
 VIEWS_PER_RUN    = int(os.environ.get("VIEWS_PER_RUN", "3"))
 IDENTITY_COUNT   = int(os.environ.get("IDENTITY_COUNT", "5"))
 MAX_RUN_SECONDS  = int(os.environ.get("MAX_RUN_SECONDS", "175"))
-VPN_MAX_TRIES    = int(os.environ.get("VPN_MAX_TRIES", "4"))
-VPN_BUDGET       = int(os.environ.get("VPN_BUDGET", "35"))
-PROXY_BUDGET     = int(os.environ.get("PROXY_BUDGET", "30"))
+VPN_MAX_TRIES    = int(os.environ.get("VPN_MAX_TRIES", "3"))
+VPN_BUDGET       = int(os.environ.get("VPN_BUDGET", "45"))
+PROXY_BUDGET     = int(os.environ.get("PROXY_BUDGET", "28"))
 USE_GOOGLE_ENTRY = os.environ.get("USE_GOOGLE_ENTRY", "true").lower() in ("1", "true", "yes")
+
+# VPN Gate is ~90% JP/KR. These are always forced into the pool.
+MUST_HAVE_VPN_COUNTRIES = ("JP", "KR")
 
 DEFAULT_VPN_COUNTRIES = (
     "US,GB,UK,"
@@ -65,11 +68,14 @@ DEFAULT_VPN_COUNTRIES = (
     "SK,BG,HR,SI,EE,LV,LT,RS,UA,IS,LU,MT,CY,"
     "JP,KR"
 )
-VPN_COUNTRIES = tuple(
+
+_vpn_list = [
     c.strip().upper()
     for c in os.environ.get("VPN_COUNTRIES", DEFAULT_VPN_COUNTRIES).split(",")
     if c.strip()
-)
+]
+VPN_AUTOFIXED = [c for c in MUST_HAVE_VPN_COUNTRIES if c not in _vpn_list]
+VPN_COUNTRIES = tuple(_vpn_list + VPN_AUTOFIXED)
 
 PROFILE_ROOT = os.path.expanduser("~/.chrome-profiles")
 TMP = tempfile.mkdtemp(prefix="smoke-")
@@ -764,7 +770,7 @@ def vpn_connect(countries=VPN_COUNTRIES):
 
     tried = 0
     for cc, ip, score, raw in spread:
-        if tried >= VPN_MAX_TRIES or vpn_time_left() < 7:
+        if tried >= VPN_MAX_TRIES or vpn_time_left() < 8:
             break
         tried += 1
 
@@ -795,10 +801,9 @@ def vpn_connect(countries=VPN_COUNTRIES):
             log(f"[!] openvpn spawn failed: {e}")
             continue
 
-        # Detect success/failure by tailing openvpn's own log -- no network calls.
         ok = False
         why = "timeout"
-        for _ in range(30):
+        for _ in range(38):
             time.sleep(0.5)
             try:
                 with open(log_path) as f:
@@ -817,7 +822,7 @@ def vpn_connect(countries=VPN_COUNTRIES):
             if "Cannot resolve host" in txt:
                 why = "dns fail"
                 break
-            if vpn_time_left() < 5:
+            if vpn_time_left() < 6:
                 why = "budget"
                 break
 
@@ -831,7 +836,7 @@ def vpn_connect(countries=VPN_COUNTRIES):
 
         log(f"[!] VPN failed {cc}/{ip} ({proto}): {why}")
         subprocess.run(["sudo", "pkill", "-f", "openvpn"], timeout=5)
-        time.sleep(0.4)
+        time.sleep(0.3)
 
     return False
 
@@ -855,7 +860,7 @@ class ProxyPool:
         head, tail = [], []
 
         for url in country_srcs:
-            if proxy_time_left() < 10:
+            if proxy_time_left() < 8:
                 break
             try:
                 r = requests.get(url, timeout=6)
@@ -868,7 +873,7 @@ class ProxyPool:
                 continue
 
         for url in bulk_srcs:
-            if proxy_time_left() < 7:
+            if proxy_time_left() < 6:
                 break
             try:
                 r = requests.get(url, timeout=6)
@@ -1212,10 +1217,6 @@ def _on_sorry_page(driver):
 
 
 def handle_google_interstitial(driver):
-    """
-    Google serves /sorry/index (unusual-traffic reCAPTCHA) to datacenter IPs.
-    Try the checkbox, then fall back to the continue= target.
-    """
     if not _on_sorry_page(driver):
         return True
 
@@ -1263,42 +1264,62 @@ def handle_google_interstitial(driver):
     return False
 
 
-def _serp_diag(driver, q):
-    try:
-        links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
-        hits = 0
-        sample = []
-        for a in links[:400]:
-            try:
-                h = a.get_attribute("href") or ""
-            except Exception:
-                continue
-            if SITE_MATCH in h and "/search?" not in h:
-                hits += 1
-                if len(sample) < 2:
-                    sample.append(h[:70])
-        log(f"    [*] SERP '{q}': {len(links)} links, {hits} ours")
-        for s in sample:
-            log(f"        -> {s}")
-    except Exception:
-        pass
-
-
-def _fast_get(driver, url, timeout=20):
+def _fast_get(driver, url, timeout=28):
     try:
         driver.set_page_load_timeout(timeout)
     except Exception:
         pass
+    ok = True
     try:
         driver.get(url)
-        return True
     except Exception:
-        return False
+        ok = False
+        try:
+            driver.execute_script("window.stop()")
+        except Exception:
+            pass
     finally:
         try:
             driver.set_page_load_timeout(40)
         except Exception:
             pass
+    return ok
+
+
+def _serp_link_count(driver):
+    try:
+        n = 0
+        for a in driver.find_elements(By.CSS_SELECTOR, "a[href]")[:400]:
+            try:
+                if _is_our_serp_link(a.get_attribute("href") or ""):
+                    n += 1
+            except Exception:
+                continue
+        return n
+    except Exception:
+        return 0
+
+
+def _click_first_our_link(driver, q, tld):
+    try:
+        for a in driver.find_elements(By.CSS_SELECTOR, "a[href]"):
+            try:
+                href = a.get_attribute("href") or ""
+            except Exception:
+                continue
+            if not _is_our_serp_link(href) or not a.is_displayed():
+                continue
+            if not hover(driver, a):
+                continue
+            time.sleep(random.uniform(0.25, 0.7))
+            click_at(driver, a)
+            time.sleep(random.uniform(1.2, 2.2))
+            if SITE_MATCH in (driver.current_url or ""):
+                log(f"    [*] entered via google.{tld}: '{q}'")
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def enter_via_google(driver, term=None):
@@ -1311,51 +1332,30 @@ def enter_via_google(driver, term=None):
 
     log(f"    [*] google entry attempt via google.{tld}")
 
-    for q in candidates:
-        if time_left() < 30:
+    for idx, q in enumerate(candidates):
+        if time_left() < 32:
             log("    [!] google entry: out of budget")
             break
 
-        if not _fast_get(driver,
-                         f"https://www.google.{tld}/search?q={quote_plus(q)}&hl=en&num=20"):
-            log(f"    [!] google.{tld} load timed out for '{q}'")
-            continue
-        time.sleep(random.uniform(1.4, 2.4))
+        url = f"https://www.google.{tld}/search?q={quote_plus(q)}&hl=en&num=20"
+        loaded = _fast_get(driver, url, timeout=28)
+        if not loaded:
+            log(f"    [!] google.{tld} slow for '{q}' -- parsing partial DOM")
+        time.sleep(random.uniform(1.0, 1.8))
 
         accept_google_consent(driver)
         handle_google_interstitial(driver)
-        scroll_burst(driver, random.uniform(1.0, 2.0))
-        _serp_diag(driver, q)
+        scroll_burst(driver, random.uniform(0.8, 1.6))
 
-        for page in range(2):
-            try:
-                for a in driver.find_elements(By.CSS_SELECTOR, "a[href]"):
-                    try:
-                        href = a.get_attribute("href") or ""
-                    except Exception:
-                        continue
-                    if not _is_our_serp_link(href) or not a.is_displayed():
-                        continue
-                    if not hover(driver, a):
-                        continue
-                    time.sleep(random.uniform(0.25, 0.7))
-                    click_at(driver, a)
-                    time.sleep(random.uniform(1.2, 2.2))
-                    if SITE_MATCH in (driver.current_url or ""):
-                        log(f"    [*] entered via google.{tld}: '{q}'")
-                        return True
-            except Exception:
-                pass
+        ours = _serp_link_count(driver)
+        log(f"    [*] SERP '{q}': {ours} of our links")
 
-            if page == 0:
-                try:
-                    nxt = driver.find_elements(By.CSS_SELECTOR, "a#pnnext, a[aria-label='Next page']")
-                    if nxt and nxt[0].is_displayed():
-                        hover(driver, nxt[0])
-                        click_at(driver, nxt[0])
-                        time.sleep(random.uniform(1.0, 2.0))
-                except Exception:
-                    pass
+        if ours and _click_first_our_link(driver, q, tld):
+            return True
+
+        if ours == 0 and idx == 0 and time_left() < 70:
+            log("    [*] skipping 2nd query (low budget)")
+            break
 
         log(f"    [!] no SERP hit for '{q}'")
 
@@ -1522,6 +1522,8 @@ def main():
     log(f"[*] utc {now.isoformat()} slot {slot_index(now)} force_click={FORCE_CLICK}")
     log(f"[*] vpn pool: {len(VPN_COUNTRIES)} countries | "
         f"budgets vpn={VPN_BUDGET}s proxy={PROXY_BUDGET}s")
+    if VPN_AUTOFIXED:
+        log(f"[*] note: added {','.join(VPN_AUTOFIXED)} to vpn pool (env list was missing them)")
     log("=" * 68)
 
     clicks_today, p_slot, views = traffic_model(now)
