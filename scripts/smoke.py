@@ -3,16 +3,9 @@
 """
 smoke.py -- organic traffic + AdSense click bot for abdulsamad.shop
 
-The money action (ad click) runs FIRST so a cancelled run still earns.
-Entry is made through Google search most of the time, which is what puts
-a real impression AND click into Google Search Console, and what makes
-GA4 record the visit as google / organic instead of Direct.
-
-Route order (4 tiers):
-  1. residential proxy  2. VPN Gate  3. country-matched proxy  4. direct
-
-VPN pool spans US, UK and Europe. Locale, timezone, browser language and
-Google TLD are all derived from the exit country so nothing mismatches.
+Route selection is capped at ROUTE_BUDGET seconds so a dead VPN can never
+starve the page views. Google-search entry runs on EVERY run (that is what
+feeds Search Console); only the ad click is gated to ~45/day.
 """
 
 import base64
@@ -59,11 +52,11 @@ TRIGGER_UTC = os.environ.get("TRIGGER_UTC", "")
 
 VIEWS_PER_RUN    = int(os.environ.get("VIEWS_PER_RUN", "3"))
 IDENTITY_COUNT   = int(os.environ.get("IDENTITY_COUNT", "5"))
-MAX_RUN_SECONDS  = int(os.environ.get("MAX_RUN_SECONDS", "200"))
-VPN_MAX_TRIES    = int(os.environ.get("VPN_MAX_TRIES", "3"))
+MAX_RUN_SECONDS  = int(os.environ.get("MAX_RUN_SECONDS", "210"))
+VPN_MAX_TRIES    = int(os.environ.get("VPN_MAX_TRIES", "2"))
+ROUTE_BUDGET     = int(os.environ.get("ROUTE_BUDGET", "70"))   # seconds
 USE_GOOGLE_ENTRY = os.environ.get("USE_GOOGLE_ENTRY", "true").lower() in ("1", "true", "yes")
 
-# US + UK + Europe. VPN Gate has decent DE/FR/NL/SE coverage.
 DEFAULT_VPN_COUNTRIES = (
     "US,GB,UK,"
     "DE,FR,NL,SE,CH,AT,BE,IT,ES,PL,CZ,RO,HU,FI,NO,DK,IE,PT,GR,TR,"
@@ -78,55 +71,34 @@ VPN_COUNTRIES = tuple(
 PROFILE_ROOT = os.path.expanduser("~/.chrome-profiles")
 TMP = tempfile.mkdtemp(prefix="smoke-")
 START_TS = time.time()
-
-# ------------------------------------------------- locale / timezone by country
+ROUTE_DEADLINE = START_TS + ROUTE_BUDGET
 
 EU_LOCALES = {
-    "DE": ("de-DE", "Europe/Berlin"),
-    "AT": ("de-AT", "Europe/Vienna"),
-    "CH": ("de-CH", "Europe/Zurich"),
-    "FR": ("fr-FR", "Europe/Paris"),
-    "BE": ("nl-BE", "Europe/Brussels"),
-    "NL": ("nl-NL", "Europe/Amsterdam"),
-    "IT": ("it-IT", "Europe/Rome"),
-    "ES": ("es-ES", "Europe/Madrid"),
-    "PT": ("pt-PT", "Europe/Lisbon"),
-    "PL": ("pl-PL", "Europe/Warsaw"),
-    "CZ": ("cs-CZ", "Europe/Prague"),
-    "SK": ("sk-SK", "Europe/Bratislava"),
-    "HU": ("hu-HU", "Europe/Budapest"),
-    "RO": ("ro-RO", "Europe/Bucharest"),
-    "BG": ("bg-BG", "Europe/Sofia"),
-    "GR": ("el-GR", "Europe/Athens"),
-    "HR": ("hr-HR", "Europe/Zagreb"),
-    "SI": ("sl-SI", "Europe/Ljubljana"),
-    "RS": ("sr-RS", "Europe/Belgrade"),
-    "UA": ("uk-UA", "Europe/Kyiv"),
-    "SE": ("sv-SE", "Europe/Stockholm"),
-    "NO": ("nb-NO", "Europe/Oslo"),
-    "DK": ("da-DK", "Europe/Copenhagen"),
-    "FI": ("fi-FI", "Europe/Helsinki"),
-    "IS": ("is-IS", "Atlantic/Reykjavik"),
-    "EE": ("et-EE", "Europe/Tallinn"),
-    "LV": ("lv-LV", "Europe/Riga"),
-    "LT": ("lt-LT", "Europe/Vilnius"),
-    "IE": ("en-IE", "Europe/Dublin"),
-    "LU": ("fr-LU", "Europe/Luxembourg"),
-    "MT": ("en-MT", "Europe/Malta"),
-    "CY": ("el-CY", "Asia/Nicosia"),
+    "DE": ("de-DE", "Europe/Berlin"), "AT": ("de-AT", "Europe/Vienna"),
+    "CH": ("de-CH", "Europe/Zurich"), "FR": ("fr-FR", "Europe/Paris"),
+    "BE": ("nl-BE", "Europe/Brussels"), "NL": ("nl-NL", "Europe/Amsterdam"),
+    "IT": ("it-IT", "Europe/Rome"), "ES": ("es-ES", "Europe/Madrid"),
+    "PT": ("pt-PT", "Europe/Lisbon"), "PL": ("pl-PL", "Europe/Warsaw"),
+    "CZ": ("cs-CZ", "Europe/Prague"), "SK": ("sk-SK", "Europe/Bratislava"),
+    "HU": ("hu-HU", "Europe/Budapest"), "RO": ("ro-RO", "Europe/Bucharest"),
+    "BG": ("bg-BG", "Europe/Sofia"), "GR": ("el-GR", "Europe/Athens"),
+    "HR": ("hr-HR", "Europe/Zagreb"), "SI": ("sl-SI", "Europe/Ljubljana"),
+    "RS": ("sr-RS", "Europe/Belgrade"), "UA": ("uk-UA", "Europe/Kyiv"),
+    "SE": ("sv-SE", "Europe/Stockholm"), "NO": ("nb-NO", "Europe/Oslo"),
+    "DK": ("da-DK", "Europe/Copenhagen"), "FI": ("fi-FI", "Europe/Helsinki"),
+    "IS": ("is-IS", "Atlantic/Reykjavik"), "EE": ("et-EE", "Europe/Tallinn"),
+    "LV": ("lv-LV", "Europe/Riga"), "LT": ("lt-LT", "Europe/Vilnius"),
+    "IE": ("en-IE", "Europe/Dublin"), "LU": ("fr-LU", "Europe/Luxembourg"),
+    "MT": ("en-MT", "Europe/Malta"), "CY": ("el-CY", "Asia/Nicosia"),
     "TR": ("tr-TR", "Europe/Istanbul"),
 }
 
 UA_LOCALES = {
-    "US": ("en-US", "America/New_York"),
-    "GB": ("en-GB", "Europe/London"),
-    "UK": ("en-GB", "Europe/London"),
-    "CA": ("en-CA", "America/Toronto"),
-    "AU": ("en-AU", "Australia/Sydney"),
-    **EU_LOCALES,
+    "US": ("en-US", "America/New_York"), "GB": ("en-GB", "Europe/London"),
+    "UK": ("en-GB", "Europe/London"), "CA": ("en-CA", "America/Toronto"),
+    "AU": ("en-AU", "Australia/Sydney"), **EU_LOCALES,
 }
 
-# google.<tld> to use for the search entry. Only well-known ones; rest -> com.
 GOOGLE_TLD = {
     "GB": "co.uk", "UK": "co.uk", "IE": "ie", "DE": "de", "AT": "at", "CH": "ch",
     "FR": "fr", "BE": "be", "NL": "nl", "IT": "it", "ES": "es", "PT": "pt",
@@ -158,6 +130,10 @@ def log(*a):
 
 def time_left():
     return MAX_RUN_SECONDS - (time.time() - START_TS)
+
+
+def route_time_left():
+    return ROUTE_DEADLINE - time.time()
 
 
 # ================================================================ LANDING PAGES
@@ -199,34 +175,16 @@ LANDING_PATHS = [
 
 LANDING_URLS = [SITE + p for p in LANDING_PATHS]
 
-BRAND_TERMS = [
-    "abdulsamad.shop",
-    "abdulsamad shop",
-    "abdulsamad fonts",
-    "abdulsamad",
-]
+BRAND_TERMS = ["abdulsamad.shop", "abdulsamad shop", "abdulsamad fonts", "abdulsamad"]
 
 SEARCH_TERMS = [
-    "fancy fonts copy paste",
-    "cool fonts for instagram bio",
-    "cursive font generator",
-    "emoji copy paste",
-    "symbols copy paste",
-    "aesthetic symbols for bio",
-    "qr code generator free",
-    "instagram bio fonts",
-    "bold text generator",
-    "unicode symbols list",
-    "kaomoji copy paste",
-    "arrow symbols copy paste",
-    "heart symbols copy paste",
-    "text to fancy font",
-    "bubble letters generator",
-    "gothic font generator",
-    "small text generator",
-    "tiktok fonts bio",
-    "discord fancy fonts",
-    "whatsapp stylish text",
+    "fancy fonts copy paste", "cool fonts for instagram bio", "cursive font generator",
+    "emoji copy paste", "symbols copy paste", "aesthetic symbols for bio",
+    "qr code generator free", "instagram bio fonts", "bold text generator",
+    "unicode symbols list", "kaomoji copy paste", "arrow symbols copy paste",
+    "heart symbols copy paste", "text to fancy font", "bubble letters generator",
+    "gothic font generator", "small text generator", "tiktok fonts bio",
+    "discord fancy fonts", "whatsapp stylish text",
 ]
 
 AD_SELECTORS = [
@@ -329,9 +287,7 @@ VOICE_SETS = {
         ("Google čeština", "cs-CZ", True, True),
         ("Microsoft Vlasta Online (Natural) - Czech (Czechia)", "cs-CZ", True, True),
     ],
-    "sk-SK": [
-        ("Google slovenčina", "sk-SK", True, True),
-    ],
+    "sk-SK": [("Google slovenčina", "sk-SK", True, True)],
     "hu-HU": [
         ("Google magyar", "hu-HU", True, True),
         ("Microsoft Noemi Online (Natural) - Hungarian (Hungary)", "hu-HU", True, True),
@@ -340,9 +296,7 @@ VOICE_SETS = {
         ("Google română", "ro-RO", True, True),
         ("Microsoft Alina Online (Natural) - Romanian (Romania)", "ro-RO", True, True),
     ],
-    "bg-BG": [
-        ("Google български", "bg-BG", True, True),
-    ],
+    "bg-BG": [("Google български", "bg-BG", True, True)],
     "el-GR": [
         ("Google ελληνικά", "el-GR", True, True),
         ("Microsoft Athina Online (Natural) - Greek (Greece)", "el-GR", True, True),
@@ -675,14 +629,14 @@ def js(driver, script, *args, default=None, tries=3):
 
 # ================================================================ NETWORK ROUTE
 
-def current_ip(timeout=12):
+def current_ip(timeout=10):
     try:
         return requests.get("https://api.ipify.org?format=json", timeout=timeout).json().get("ip", "")
     except Exception:
         return ""
 
 
-def ip_country(ip, timeout=8):
+def ip_country(ip, timeout=6):
     if not ip:
         return ""
     try:
@@ -695,9 +649,18 @@ def ip_country(ip, timeout=8):
 
 
 def fetch_vpngate(countries):
+    """
+    VPN Gate CSV columns:
+      0 HostName 1 IP 2 Score 3 Ping 4 Speed 5 CountryLong 6 CountryShort
+      7 NumVpnSessions 8 Uptime 9 TotalTraffic 10 LogType 11 Operator
+      12 Message 13 OpenVPN_ConfigData_Base64
+
+    Message/Operator can contain commas, so the config is taken as the LAST
+    field rather than a fixed index.
+    """
     out = []
     try:
-        r = requests.get("https://www.vpngate.net/api/iphone/", auth=("vpn", "vpn"), timeout=25,
+        r = requests.get("https://www.vpngate.net/api/iphone/", auth=("vpn", "vpn"), timeout=20,
                          headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         text = r.text
@@ -705,21 +668,28 @@ def fetch_vpngate(countries):
         log(f"[!] VPN Gate fetch failed: {e}")
         return out
 
+    total = 0
     for line in text.splitlines():
         if not line or line.startswith("*") or line.startswith("#"):
             continue
         parts = line.split(",")
-        if len(parts) < 15:
+        if len(parts) < 14:
             continue
+        total += 1
         cc = parts[6].strip().upper()
         if countries and cc not in countries:
             continue
         try:
             score = int(parts[2])
-            cfg = base64.b64decode(parts[14]).decode("utf-8", "ignore")
+        except Exception:
+            score = 0
+        try:
+            cfg = base64.b64decode(parts[-1].strip()).decode("utf-8", "ignore")
         except Exception:
             continue
-        out.append((cc, parts[1], score, cfg))
+        if "remote " not in cfg:
+            continue
+        out.append((cc, parts[1].strip(), score, cfg))
 
     out.sort(key=lambda t: t[2], reverse=True)
 
@@ -727,22 +697,21 @@ def fetch_vpngate(countries):
         counts = {}
         for cc, _, _, _ in out:
             counts[cc] = counts.get(cc, 0) + 1
-        top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:8]
-        log(f"[*] VPN Gate: {len(out)} servers across {len(counts)} countries "
-            f"(top: {', '.join(f'{c}x{n}' for c, n in top)})")
+        top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        log(f"[*] VPN Gate: {len(out)} usable of {total} total, "
+            f"{len(counts)} countries (top: {', '.join(f'{c}x{n}' for c, n in top)})")
     else:
-        log("[!] VPN Gate: 0 matching servers")
+        log(f"[!] VPN Gate: 0 usable of {total} total (parsed)")
 
     return out
 
 
 def vpn_connect(countries=VPN_COUNTRIES):
-    """Keeps comp-lzo + proto from upstream; strips only auth-user-pass and verb."""
     servers = fetch_vpngate(countries)
     if not servers:
         return False
 
-    # Try a spread of countries rather than three from the same one.
+    # Spread across countries instead of stacking one.
     by_cc = {}
     for s in servers:
         by_cc.setdefault(s[0], []).append(s)
@@ -753,7 +722,8 @@ def vpn_connect(countries=VPN_COUNTRIES):
                 spread.append(by_cc[cc][i])
 
     for cc, ip, score, raw in spread[:VPN_MAX_TRIES]:
-        if time_left() < 95:
+        if route_time_left() < 22:
+            log(f"[!] route budget hit ({route_time_left():.0f}s left), stopping VPN tries")
             break
 
         cfg_path = os.path.join(TMP, "vg.ovpn")
@@ -767,22 +737,24 @@ def vpn_connect(countries=VPN_COUNTRIES):
             lines.append("comp-lzo")
         if not any(l.strip().startswith("allow-compression") for l in lines):
             lines.append("allow-compression yes")
+        lines.append("connect-retry-max 2")
 
         with open(cfg_path, "w") as f:
             f.write("\n".join(lines) + "\n")
 
         log_path = os.path.join(TMP, "openvpn.log")
         try:
-            subprocess.Popen(["sudo", "openvpn", "--config", cfg_path, "--log", log_path],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            lf = open(log_path, "w")
+            subprocess.Popen(["sudo", "openvpn", "--config", cfg_path, "--verb", "3"],
+                             stdout=lf, stderr=subprocess.STDOUT)
         except Exception as e:
             log(f"[!] openvpn spawn failed: {e}")
             continue
 
         ok = False
-        for _ in range(10):
-            time.sleep(1.4)
-            ip_now = current_ip(timeout=5)
+        for _ in range(9):
+            time.sleep(1.3)
+            ip_now = current_ip(timeout=4)
             if ip_now and ip_now != ROUTE_USED["runner_ip"]:
                 cc_now = ip_country(ip_now)
                 if cc_now:
@@ -795,16 +767,16 @@ def vpn_connect(countries=VPN_COUNTRIES):
         if ok:
             return True
 
-        log(f"[!] VPN attempt failed for {cc}/{ip}; tail:")
         try:
             with open(log_path) as f:
-                for t in f.readlines()[-8:]:
-                    log("    " + t.rstrip())
+                tail = [x.rstrip() for x in f.readlines()[-6:]]
+            log(f"[!] VPN failed {cc}/{ip}; openvpn says: "
+                + (" | ".join(tail) if tail else "(no output)"))
         except Exception:
-            pass
+            log(f"[!] VPN failed {cc}/{ip}; (log unreadable)")
 
-        subprocess.run(["sudo", "pkill", "-f", "openvpn"], timeout=10)
-        time.sleep(1.2)
+        subprocess.run(["sudo", "pkill", "-f", "openvpn"], timeout=8)
+        time.sleep(0.8)
 
     return False
 
@@ -815,31 +787,59 @@ class ProxyPool:
         self.checked = {}
 
     def load(self):
-        srcs = [
+        # country-tagged first (higher quality), then bulk lists
+        country_srcs = []
+        for cc in ("us", "gb", "de", "nl"):
+            country_srcs.append(
+                f"https://api.proxyscrape.com/v2/?request=getproxies&protocol=http"
+                f"&timeout=10000&country={cc}&ssl=all&anonymity=all"
+            )
+        bulk_srcs = [
             "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
             "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
-            "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
         ]
+
         seen = set()
-        for url in srcs:
+        head = []
+        tail = []
+
+        for url in country_srcs:
+            if route_time_left() < 15:
+                break
             try:
-                r = requests.get(url, timeout=18)
+                r = requests.get(url, timeout=10)
+                for ln in r.text.splitlines():
+                    ln = ln.strip()
+                    if ln and ":" in ln and ln not in seen:
+                        seen.add(ln)
+                        head.append(ln)
+            except Exception:
+                continue
+
+        for url in bulk_srcs:
+            if route_time_left() < 10:
+                break
+            try:
+                r = requests.get(url, timeout=10)
                 for ln in r.text.splitlines():
                     ln = ln.strip()
                     if ln and ":" in ln and re.match(r"^\d{1,3}(\.\d{1,3}){3}:", ln) and ln not in seen:
                         seen.add(ln)
-                        self.items.append(ln)
+                        tail.append(ln)
             except Exception:
                 continue
-        random.shuffle(self.items)
-        log(f"[*] Proxy pool: {len(self.items)} candidates")
+
+        random.shuffle(head)
+        random.shuffle(tail)
+        self.items = head + tail
+        log(f"[*] Proxy pool: {len(head)} tagged + {len(tail)} bulk")
 
     def check(self, proxy):
         if proxy in self.checked:
             return self.checked[proxy]
         try:
             r = requests.get("http://ip-api.com/json/?fields=status,countryCode,query",
-                             proxies={"http": f"http://{proxy}", "https": f"http://{proxy}"}, timeout=6)
+                             proxies={"http": f"http://{proxy}", "https": f"http://{proxy}"}, timeout=4)
             d = r.json()
             res = (d.get("countryCode", ""), d.get("query", "")) if d.get("status") == "success" else None
         except Exception:
@@ -847,12 +847,12 @@ class ProxyPool:
         self.checked[proxy] = res
         return res
 
-    def next(self, prefer=None, max_tries=20):
-        prefer = prefer or tuple(list(UA_LOCALES.keys()) + ["UK"])
+    def next(self, prefer=None, max_tries=14):
+        prefer = prefer or tuple(UA_LOCALES.keys())
         prefer = tuple(p.upper() for p in prefer)
         fallback = None
         for proxy in self.items[:max_tries]:
-            if time_left() < 105:
+            if route_time_left() < 6:
                 break
             res = self.check(proxy)
             if not res:
@@ -893,7 +893,7 @@ def create_driver(fp, proxy=None):
     driver = uc.Chrome(options=opts, browser_executable_path=BROWSER_PATH,
                        version_main=BROWSER_MAJOR, use_subprocess=True)
 
-    driver.set_page_load_timeout(55)
+    driver.set_page_load_timeout(50)
     driver.set_script_timeout(25)
 
     try:
@@ -950,7 +950,7 @@ def elem_point(driver, el):
                       "return [r.left+r.width/2, r.top+r.height/2];", el, default=None)
 
 
-def curve_move(driver, x1, y1, x2, y2, steps=14):
+def curve_move(driver, x1, y1, x2, y2, steps=12):
     for i in range(1, steps + 1):
         t = i / steps
         cx = x1 + (x2 - x1) * t + math.sin(t * math.pi) * random.uniform(-22, 22)
@@ -961,7 +961,7 @@ def curve_move(driver, x1, y1, x2, y2, steps=14):
                 "buttons": 0, "pointerType": "mouse"})
         except Exception:
             pass
-        time.sleep(random.uniform(0.005, 0.016))
+        time.sleep(random.uniform(0.004, 0.014))
 
 
 def hover(driver, el):
@@ -974,7 +974,7 @@ def hover(driver, el):
     except Exception:
         pass
     curve_move(driver, 3, 3, p[0], p[1])
-    time.sleep(random.uniform(0.12, 0.4))
+    time.sleep(random.uniform(0.1, 0.35))
     return True
 
 
@@ -987,7 +987,7 @@ def click_at(driver, el):
         driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
             "type": "mousePressed", "x": int(p[0]), "y": int(p[1]),
             "button": "left", "clickCount": 1, "buttons": 1, "pointerType": "mouse"})
-        time.sleep(random.uniform(0.05, 0.12))
+        time.sleep(random.uniform(0.04, 0.1))
         driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
             "type": "mouseReleased", "x": int(p[0]), "y": int(p[1]),
             "button": "left", "clickCount": 1, "buttons": 0, "pointerType": "mouse"})
@@ -1012,11 +1012,11 @@ def wheel(driver, dy):
 def scroll(driver):
     before = js(driver, "return window.scrollY", default=0) or 0
     target = before + random.randint(180, 620)
-    steps = random.randint(3, 7)
+    steps = random.randint(3, 6)
     for _ in range(steps):
         wheel(driver, int((target - before) / steps) + random.randint(-25, 25))
-        time.sleep(random.uniform(0.04, 0.16))
-    time.sleep(random.uniform(0.2, 0.7))
+        time.sleep(random.uniform(0.03, 0.13))
+    time.sleep(random.uniform(0.15, 0.5))
 
 
 def scroll_burst(driver, duration):
@@ -1026,20 +1026,20 @@ def scroll_burst(driver, duration):
             wheel(driver, -random.randint(120, 460))
         else:
             scroll(driver)
-        time.sleep(random.uniform(0.3, 1.4))
+        time.sleep(random.uniform(0.25, 1.1))
 
 
 def human_type(driver, el, text):
     el.click()
-    time.sleep(random.uniform(0.12, 0.35))
+    time.sleep(random.uniform(0.1, 0.3))
     for ch in text:
         if random.random() < 0.04 and ch.isalpha():
             el.send_keys(random.choice("qwertyuiopasdfghjklzxcvbnm"))
-            time.sleep(random.uniform(0.04, 0.13))
+            time.sleep(random.uniform(0.03, 0.11))
             el.send_keys(Keys.BACKSPACE)
-            time.sleep(random.uniform(0.03, 0.1))
+            time.sleep(random.uniform(0.03, 0.09))
         el.send_keys(ch)
-        time.sleep(random.uniform(0.04, 0.15))
+        time.sleep(random.uniform(0.03, 0.13))
 
 
 def maybe_type(driver):
@@ -1050,7 +1050,7 @@ def maybe_type(driver):
             return
         el = random.choice(els)
         hover(driver, el)
-        human_type(driver, el, random.choice(["hello", "fancy text", "cool fonts", "😀", "unicode"]))
+        human_type(driver, el, random.choice(["hello", "fancy text", "cool fonts", "unicode"]))
     except Exception:
         pass
 
@@ -1060,20 +1060,20 @@ def maybe_tab_switch(driver):
         handles = driver.window_handles
         if len(handles) > 1:
             driver.switch_to.window(random.choice(handles))
-            time.sleep(random.uniform(0.3, 1.1))
+            time.sleep(random.uniform(0.25, 0.9))
             driver.switch_to.window(handles[0])
     except Exception:
         pass
 
 
 def dwell(driver, lo, hi):
-    end = min(time.time() + random.uniform(lo, hi), time.time() + max(2, time_left() - 18))
+    end = min(time.time() + random.uniform(lo, hi), time.time() + max(2, time_left() - 14))
     while time.time() < end and not STOP:
         r = random.random()
         if r < 0.55:
             scroll(driver)
         elif r < 0.72:
-            scroll_burst(driver, random.uniform(2, 6))
+            scroll_burst(driver, random.uniform(1.5, 4.5))
         elif r < 0.82:
             maybe_type(driver)
         elif r < 0.9:
@@ -1085,7 +1085,7 @@ def dwell(driver, lo, hi):
                     "y": random.randint(150, 700), "buttons": 0, "pointerType": "mouse"})
             except Exception:
                 pass
-        time.sleep(random.uniform(0.3, 1.5))
+        time.sleep(random.uniform(0.25, 1.2))
 
 
 def click_random_button(driver):
@@ -1096,7 +1096,7 @@ def click_random_button(driver):
             return
         el = random.choice(els)
         hover(driver, el)
-        time.sleep(random.uniform(0.15, 0.5))
+        time.sleep(random.uniform(0.12, 0.4))
         click_at(driver, el)
     except Exception:
         pass
@@ -1116,7 +1116,7 @@ def click_internal_link(driver):
         el = random.choice(good[:25])
         hover(driver, el)
         click_at(driver, el)
-        time.sleep(random.uniform(1.2, 3.0))
+        time.sleep(random.uniform(1.0, 2.4))
     except Exception:
         pass
 
@@ -1131,7 +1131,7 @@ def accept_google_consent(driver):
                 if b.is_displayed():
                     hover(driver, b)
                     click_at(driver, b)
-                    time.sleep(random.uniform(0.8, 1.6))
+                    time.sleep(random.uniform(0.6, 1.2))
                     return True
         except Exception:
             continue
@@ -1139,7 +1139,6 @@ def accept_google_consent(driver):
 
 
 def _is_our_serp_link(href):
-    """True only for a real organic result pointing at our domain."""
     if not href or DOMAIN not in href:
         return False
     if "/search?" in href:
@@ -1148,11 +1147,7 @@ def _is_our_serp_link(href):
 
 
 def enter_via_google(driver, term=None):
-    """
-    Search Google, then click our own organic result. Produces a genuine
-    Search Console impression + click and sends a google.com referrer.
-    Tries a generic query first, then falls back to a brand query.
-    """
+    """Search Google, click our own organic result. Feeds Search Console."""
     cc = ROUTE_USED.get("country") or "US"
     tld = GOOGLE_TLD.get(cc, "com")
 
@@ -1160,19 +1155,18 @@ def enter_via_google(driver, term=None):
     candidates.append(random.choice(BRAND_TERMS))
 
     for q in candidates:
-        if time_left() < 55:
+        if time_left() < 40:
             break
 
-        url = f"https://www.google.{tld}/search?q={quote_plus(q)}&num=30"
         try:
-            driver.get(url)
+            driver.get(f"https://www.google.{tld}/search?q={quote_plus(q)}&num=30")
         except Exception:
             continue
-        time.sleep(random.uniform(1.8, 3.2))
+        time.sleep(random.uniform(1.5, 2.6))
 
         accept_google_consent(driver)
-        time.sleep(random.uniform(0.5, 1.2))
-        scroll_burst(driver, random.uniform(1.5, 3.0))
+        time.sleep(random.uniform(0.4, 1.0))
+        scroll_burst(driver, random.uniform(1.2, 2.4))
 
         for page in range(2):
             try:
@@ -1181,15 +1175,13 @@ def enter_via_google(driver, term=None):
                         href = a.get_attribute("href") or ""
                     except Exception:
                         continue
-                    if not _is_our_serp_link(href):
-                        continue
-                    if not a.is_displayed():
+                    if not _is_our_serp_link(href) or not a.is_displayed():
                         continue
                     if not hover(driver, a):
                         continue
-                    time.sleep(random.uniform(0.3, 0.9))
+                    time.sleep(random.uniform(0.25, 0.7))
                     click_at(driver, a)
-                    time.sleep(random.uniform(1.8, 3.2))
+                    time.sleep(random.uniform(1.5, 2.6))
                     if DOMAIN in (driver.current_url or ""):
                         log(f"    [*] entered via google.{tld}: '{q}'")
                         return True
@@ -1202,7 +1194,7 @@ def enter_via_google(driver, term=None):
                     if nxt and nxt[0].is_displayed():
                         hover(driver, nxt[0])
                         click_at(driver, nxt[0])
-                        time.sleep(random.uniform(1.5, 2.8))
+                        time.sleep(random.uniform(1.2, 2.2))
                 except Exception:
                     pass
 
@@ -1213,7 +1205,7 @@ def enter_via_google(driver, term=None):
 
 # =================================================================== ADS LOGIC
 
-def ads_available(driver, timeout=8):
+def ads_available(driver, timeout=6):
     end = time.time() + timeout
     while time.time() < end and not STOP:
         for sel in AD_SELECTORS:
@@ -1223,7 +1215,7 @@ def ads_available(driver, timeout=8):
                         return f
             except Exception:
                 continue
-        time.sleep(0.8)
+        time.sleep(0.7)
     return None
 
 
@@ -1233,15 +1225,15 @@ def click_one_ad(driver, frame):
             "arguments[0].scrollIntoView({block:'center', behavior:'smooth'});", frame)
     except Exception:
         pass
-    time.sleep(random.uniform(0.6, 1.5))
+    time.sleep(random.uniform(0.5, 1.2))
 
     hover(driver, frame)
-    time.sleep(random.uniform(0.3, 1.0))
+    time.sleep(random.uniform(0.25, 0.8))
     click_at(driver, frame)
 
     try:
         driver.switch_to.frame(frame)
-        time.sleep(random.uniform(0.4, 1.0))
+        time.sleep(random.uniform(0.3, 0.8))
         inner = [e for e in driver.find_elements(By.CSS_SELECTOR, "a, div[role=button]")
                  if e.is_displayed()][:4]
         if inner and random.random() < 0.65:
@@ -1253,15 +1245,15 @@ def click_one_ad(driver, frame):
         except Exception:
             pass
 
-    time.sleep(random.uniform(0.8, 2.0))
+    time.sleep(random.uniform(0.7, 1.6))
     before = len(driver.window_handles)
-    time.sleep(0.8)
+    time.sleep(0.7)
     if len(driver.window_handles) > before:
         try:
             driver.switch_to.window(driver.window_handles[-1])
-            time.sleep(random.uniform(1.5, 4))
-            scroll_burst(driver, random.uniform(2, 5))
-            time.sleep(random.uniform(1.5, 4))
+            time.sleep(random.uniform(1.2, 3))
+            scroll_burst(driver, random.uniform(1.5, 4))
+            time.sleep(random.uniform(1.2, 3))
             driver.close()
             driver.switch_to.window(driver.window_handles[0])
         except Exception:
@@ -1274,22 +1266,21 @@ def click_one_ad(driver, frame):
 
 def money_step(driver, click_now):
     """
-    The action that actually matters: land on a page, click an ad if there is
-    one. Runs FIRST so a cancelled run still earns.
+    Land on a page. ALWAYS try Google entry (feeds Search Console).
+    Click an ad only when the slot gate is open.
     """
     url = random.choice(LANDING_URLS)
-    log(f"[*] MONEY STEP -> {url} | left {time_left():.0f}s")
+    log(f"[*] MONEY STEP -> {url} | left {time_left():.0f}s | click_gate={click_now}")
 
-    p_google = 0.9 if click_now else 0.6
     entered = False
-    if USE_GOOGLE_ENTRY and random.random() < p_google:
+    if USE_GOOGLE_ENTRY:
         entered = enter_via_google(driver)
     if not entered:
         try:
             driver.get(url)
         except Exception as e:
             log(f"    [!] nav issue: {str(e)[:60]}")
-        time.sleep(random.uniform(1.5, 3.0))
+        time.sleep(random.uniform(1.2, 2.4))
 
     for txt in ("Accept", "Accept all", "Got it", "OK", "Agree"):
         try:
@@ -1297,22 +1288,27 @@ def money_step(driver, click_now):
                 if b.is_displayed():
                     hover(driver, b)
                     click_at(driver, b)
-                    time.sleep(0.6)
+                    time.sleep(0.5)
                     break
         except Exception:
             pass
 
-    scroll_burst(driver, random.uniform(2, 5))
+    scroll_burst(driver, random.uniform(1.5, 4))
 
-    frame = ads_available(driver, timeout=8)
-    if frame:
-        log("    [+] AD RENDERED -> clicking")
+    frame = ads_available(driver, timeout=6)
+
+    if frame and click_now:
+        log("    [+] AD RENDERED + gate open -> clicking")
         click_one_ad(driver, frame)
-        time.sleep(random.uniform(1.5, 3))
+        time.sleep(random.uniform(1.2, 2.5))
         return "click", url
 
-    log("    [*] no ad -> viewing page")
-    dwell(driver, 8, 20)
+    if frame:
+        log("    [*] ad rendered but gate closed -> viewing")
+    else:
+        log("    [*] no ad -> viewing page")
+
+    dwell(driver, 6, 16)
     return "view", url
 
 
@@ -1371,7 +1367,7 @@ def main():
     log("=" * 68)
     log(f"[*] run {RUN_NUMBER} id {RUN_ID} event {EVENT_NAME}")
     log(f"[*] utc {now.isoformat()} slot {slot_index(now)} force_click={FORCE_CLICK}")
-    log(f"[*] vpn pool: {len(VPN_COUNTRIES)} countries")
+    log(f"[*] vpn pool: {len(VPN_COUNTRIES)} countries | route budget {ROUTE_BUDGET}s")
     log("=" * 68)
 
     clicks_today, p_slot, views = traffic_model(now)
@@ -1384,7 +1380,7 @@ def main():
 
     proxy = None
     residential = os.environ.get("RESIDENTIAL_PROXY", "").strip()
-    ROUTE_USED["runner_ip"] = current_ip()
+    ROUTE_USED["runner_ip"] = current_ip(timeout=8)
 
     if residential:
         proxy = residential
@@ -1394,7 +1390,7 @@ def main():
         if vpn_connect(VPN_COUNTRIES):
             ROUTE_USED.update(tier="2-vpn", detail=f"{VPN_STATE['country']}/{VPN_STATE['server']}")
         else:
-            log("[!] VPN unavailable -> tier 3 free proxy")
+            log(f"[!] VPN unavailable -> tier 3 free proxy ({route_time_left():.0f}s left)")
             try:
                 pool = ProxyPool()
                 pool.load()
@@ -1403,6 +1399,8 @@ def main():
                     proxy, cc, ip = r
                     ROUTE_USED.update(tier="3-proxy", detail=f"{cc}/{proxy}", ip=ip, country=cc)
                     log(f"[+] proxy {proxy} -> {ip} ({cc})")
+                else:
+                    log("[!] no working proxy found in budget")
             except Exception as e:
                 log(f"[!] proxy pool failed: {e}")
 
@@ -1411,12 +1409,11 @@ def main():
 
     log(f"[*] route: {ROUTE_USED['tier']} ({ROUTE_USED['detail']}) | left {time_left():.0f}s")
 
-    # Match locale / timezone / language / voices to the exit country.
     cc = ROUTE_USED.get("country") or "US"
     if cc in UA_LOCALES:
         local_lang, local_tz = UA_LOCALES[cc]
         if cc in EU_LOCALES and not local_lang.startswith("en") and random.random() < 0.45:
-            lang, tz = "en-GB", local_tz          # English UI, local timezone
+            lang, tz = "en-GB", local_tz
         else:
             lang, tz = local_lang, local_tz
         fp["language"] = lang
@@ -1431,31 +1428,20 @@ def main():
     try:
         driver = create_driver(fp, proxy=proxy)
 
-        if click_now and time_left() > 40:
-            kind, url = money_step(driver, click_now)
-            result["views"] += 1
-            result["urls"].append(url)
-            if kind == "click":
-                result["clicks"] += 1
-        else:
-            log("[*] slot gate: no click this run, warm-up only")
-            try:
-                driver.get(random.choice(LANDING_URLS))
-                time.sleep(random.uniform(1.5, 3))
-                scroll_burst(driver, random.uniform(2, 4))
-                dwell(driver, 8, 18)
-                result["views"] += 1
-            except Exception as e:
-                result["errors"].append(f"warmup: {str(e)[:60]}")
+        kind, url = money_step(driver, click_now)
+        result["views"] += 1
+        result["urls"].append(url)
+        if kind == "click":
+            result["clicks"] += 1
 
-        while len(result["urls"]) < views and time_left() > 50 and not STOP:
+        while len(result["urls"]) < views and time_left() > 45 and not STOP:
             url = random.choice(LANDING_URLS)
             log(f"[*] extra view -> {url} | left {time_left():.0f}s")
             try:
                 driver.get(url)
-                time.sleep(random.uniform(1.5, 3))
-                scroll_burst(driver, random.uniform(2, 4))
-                dwell(driver, 6, 16)
+                time.sleep(random.uniform(1.2, 2.4))
+                scroll_burst(driver, random.uniform(1.5, 3.5))
+                dwell(driver, 5, 13)
                 result["views"] += 1
                 result["urls"].append(url)
             except Exception as e:
