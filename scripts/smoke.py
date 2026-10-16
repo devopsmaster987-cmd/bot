@@ -3,19 +3,15 @@
 """
 smoke.py - anti-detection AdSense traffic bot for abdulsamad.shop
 
-Phases per run
-  Phase 1 - IMPRESSIONS. Rotates long-tail queries derived from the site's own
-            sitemap slugs across several Google country domains. Loads the SERP,
-            scrolls our result into the viewport (this is what GSC records as an
-            impression), and only sometimes clicks through. Each rendered SERP
-            containing our link = 1 impression.
-  Phase 2 - VIEWS/CLICKS. Tops up page views and ad clicks with direct
-            navigation until the per-run targets are met.
+Session start
+  google_health_check() proves Google is reachable from the chosen route and
+  solves the /sorry/ reCAPTCHA (frame-aware) ONCE. The abuse-exemption cookie
+  then persists for the rest of the session and across runs via the profile.
 
-Daily model
-  60 clicks/day across ~6 runs. Pacing is driven by RUNS so the schedule stays
-  correct while AdSense is unapproved and clicks are 0.
-  State lives in .chrome-profiles/.bot-state/ so it rides the existing cache.
+Phase 1 - IMPRESSIONS (only if Google is healthy)
+Phase 2 - VIEWS/CLICKS (always runs, so a Google outage can't waste a run)
+
+Circuit breaker: 3 consecutive Google failures ends phase 1.
 """
 
 from __future__ import annotations
@@ -33,7 +29,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import requests
 
@@ -83,12 +79,14 @@ TARGET_IMPRESSIONS = int(os.environ.get("TARGET_IMPRESSIONS_PER_RUN", "6"))
 MAX_IMPRESSION_PASSES = int(os.environ.get(
     "MAX_IMPRESSION_PASSES", str(max(TARGET_IMPRESSIONS * 3, 8))))
 MAX_PAGES_PER_RUN = int(os.environ.get("MAX_PAGES_PER_RUN", str(TARGET_CLICKS + TARGET_VIEWS)))
-MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "600"))
+MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "540"))
 NO_AD_PAGE_CAP = int(os.environ.get("NO_AD_PAGE_CAP", "8"))
 
-# chance that an impression pass also clicks through (-> a view)
+PHASE1_MAX_SECONDS = int(os.environ.get("PHASE1_MAX_SECONDS", "180"))
+GOOGLE_FAIL_LIMIT = int(os.environ.get("GOOGLE_FAIL_LIMIT", "3"))
+GOOGLE_PASS_CAP = int(os.environ.get("GOOGLE_PASS_CAP", "25"))
+
 CLICK_THROUGH_RATE = float(os.environ.get("CLICK_THROUGH_RATE", "0.45"))
-# chance that a click-through ad slot gets clicked
 AD_CLICK_RATE = float(os.environ.get("AD_CLICK_RATE", "0.8"))
 
 DAILY_CLICK_TARGET = int(os.environ.get("DAILY_CLICK_TARGET", "60"))
@@ -96,11 +94,11 @@ DAILY_RUN_TARGET = int(os.environ.get(
     "DAILY_RUN_TARGET", str(max(DAILY_CLICK_TARGET // max(TARGET_CLICKS, 1), 1))))
 RUNS_PER_DAY = int(os.environ.get("RUNS_PER_DAY", "104"))
 
-VPN_BUDGET = int(os.environ.get("VPN_BUDGET", "90"))
-VPN_TRY_TIMEOUT = int(os.environ.get("VPN_TRY_TIMEOUT", "20"))
-PROXY_BUDGET = int(os.environ.get("PROXY_BUDGET", "25"))
-VPN_MAX_TRIES = int(os.environ.get("VPN_MAX_TRIES", "4"))
-GOOGLE_CAP = int(os.environ.get("GOOGLE_CAP", "70"))
+VPN_BUDGET = int(os.environ.get("VPN_BUDGET", "100"))
+VPN_TRY_TIMEOUT = int(os.environ.get("VPN_TRY_TIMEOUT", "18"))
+PROXY_BUDGET = int(os.environ.get("PROXY_BUDGET", "45"))
+VPN_MAX_TRIES = int(os.environ.get("VPN_MAX_TRIES", "5"))
+PROXY_PREFLIGHT = int(os.environ.get("PROXY_PREFLIGHT", "5"))
 
 FORCE_CLICK = env_flag("FORCE_CLICK")
 IGNORE_DAILY_CAP = env_flag("IGNORE_DAILY_CAP")
@@ -131,16 +129,12 @@ PAGES = [
     "/math-symbols", "/bracket-symbols", "/misc-symbols", "/random-text",
 ]
 
-# Multiple Google properties: GSC aggregates impressions across all of them,
-# so each extra domain is another chance for the same query.
+# Fewer Google properties - each extra domain is another chance to hit /sorry/
 GOOGLE_HOSTS = [
-    "www.google.com", "www.google.com", "www.google.com",
+    "www.google.com", "www.google.com", "www.google.com", "www.google.com",
     "www.google.co.uk", "www.google.ca", "www.google.com.au",
-    "www.google.co.in", "www.google.ie", "www.google.co.nz",
 ]
 
-# Branded + curated head terms. Slug-derived long-tail queries are appended
-# at runtime from the live sitemap.
 BRAND_QUERIES = [
     "abdulsamad.shop", "abdulsamad.shop", "abdulsamad shop",
     "abdulsamad", "abdulsamad shop fonts",
@@ -161,16 +155,20 @@ QUERY_POOL: list[str] = []
 
 
 def build_query_pool(pages: list[str]) -> list[str]:
-    """Brand queries + head terms + long-tail derived from sitemap slugs."""
     pool = list(BRAND_QUERIES) + list(HEAD_QUERIES)
 
     slugs = []
     for p in pages:
-        slug = p.strip("/").replace("-", " ").strip()
+        # "/fonts/kaomoji-shrug" -> "fonts kaomoji shrug"
+        slug = re.sub(r"[-/_]+", " ", p).strip().lower()
+        slug = re.sub(r"\s+", " ", slug)
         if not slug or slug in ("about", "contact", "privacy policy", "terms"):
+            continue
+        if len(slug) < 4:
             continue
         slugs.append(slug)
 
+    slugs = list(dict.fromkeys(slugs))
     random.shuffle(slugs)
     for slug in slugs[:40]:
         pool.append(slug)
@@ -294,7 +292,6 @@ def slot_gate(state: dict) -> bool:
 
     now = datetime.now(timezone.utc)
     rng = random.Random(day_seed() ^ int(now.timestamp() // 900))
-
     remaining_runs = max(target_runs - runs_done, 0)
     remaining_triggers = max(RUNS_PER_DAY * (1.0 - weight_fraction(now)), 1.0)
     prob = min(max(remaining_runs / remaining_triggers, 0.02), 0.90)
@@ -335,6 +332,16 @@ def fetch_pages() -> list[str]:
 # ---------------------------------------------------------------------------
 # PROXY POOL
 # ---------------------------------------------------------------------------
+def proxy_alive(addr: str, timeout: float = 8.0) -> bool:
+    px = {"http": f"http://{addr}", "https": f"http://{addr}"}
+    try:
+        r = requests.get("https://www.google.com/generate_204",
+                         proxies=px, timeout=timeout, allow_redirects=False)
+        return r.status_code in (200, 204)
+    except Exception:
+        return False
+
+
 class ProxyPool:
     SOURCES = [
         "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=8000&ssl=all&anonymity=elite",
@@ -398,7 +405,21 @@ class ProxyPool:
             self.good = [{"addr": a, "cc": "??"} for a in sample[:60]]
 
         self.good.sort(key=lambda p: (p["cc"] not in self.prefer, p["cc"]))
-        log(f"[*] proxies validated: {len(self.good)}")
+        log(f"[*] proxies geolocated: {len(self.good)}")
+
+    def next_alive(self, deadline: float, tries: int = 5):
+        """Pre-flight with a real request so Chrome never opens a dead proxy."""
+        checked = 0
+        while checked < tries and budget_left(deadline) > 0:
+            cand = self.next()
+            if not cand:
+                return None
+            checked += 1
+            if proxy_alive(cand["addr"]):
+                log(f"    [+] proxy alive: {cand['addr']} ({cand['cc']})")
+                return cand
+            log(f"    [.] proxy dead: {cand['addr']} ({cand['cc']})")
+        return None
 
     def next(self):
         for p in self.good:
@@ -551,6 +572,20 @@ def wait_for_tunnel(proc, deadline: float) -> bool:
     return False
 
 
+def tunnel_has_egress(deadline: float) -> str | None:
+    """Confirm traffic actually flows through the tunnel."""
+    end = min(time.time() + 12, deadline)
+    while time.time() < end:
+        try:
+            r = requests.get("https://api.ipify.org", timeout=6)
+            if r.status_code == 200 and r.text.strip():
+                return r.text.strip()
+        except Exception:
+            pass
+        time.sleep(1.0)
+    return None
+
+
 def stop_vpn(proc) -> None:
     if not proc:
         return
@@ -604,7 +639,7 @@ WEBGL_MAP = {
 }
 
 
-def build_identity() -> dict:
+def build_identity(ident_id: int) -> dict:
     base = random.choice(BASE_IDENTITIES).copy()
     full = f"{CHROME_MAJOR}.0.{4000 + random.randint(0, 90)}.{random.randint(0, 60)}"
     if base["platform"] == "MacIntel":
@@ -620,7 +655,7 @@ def build_identity() -> dict:
     ]
     base["vendor"], base["renderer"] = WEBGL_MAP.get(base["platform"], WEBGL_MAP["Win32"])
     base["ua_full"] = full
-    base["id"] = random.randint(1, 5)
+    base["id"] = ident_id
     return base
 
 
@@ -785,7 +820,7 @@ def build_driver(ident: dict, proxy: str | None):
         kwargs["browser_executable_path"] = chrome_bin
 
     driver = uc.Chrome(**kwargs)
-    driver.set_page_load_timeout(35)
+    driver.set_page_load_timeout(30)
     driver.set_script_timeout(25)
     apply_identity(driver, ident)
     return driver
@@ -801,6 +836,16 @@ def _url(driver) -> str:
         return ""
 
 
+def _is_error_page(driver) -> bool:
+    if _url(driver).startswith("chrome-error://"):
+        return True
+    try:
+        t = driver.title or ""
+    except Exception:
+        t = ""
+    return bool(re.fullmatch(r"www\.[a-z0-9.\-]+", t.strip()))
+
+
 def _fast_get(driver, url: str, cap: float) -> None:
     try:
         driver.get(url)
@@ -811,6 +856,12 @@ def _fast_get(driver, url: str, cap: float) -> None:
             pass
     waited = 0.0
     while waited < cap:
+        if _is_error_page(driver):
+            time.sleep(0.6)
+            waited += 0.6
+            if waited > 3.0:
+                break
+            continue
         try:
             if js(driver, "return document.readyState") == "complete":
                 break
@@ -821,11 +872,10 @@ def _fast_get(driver, url: str, cap: float) -> None:
 
 
 def handle_google_consent(driver, deadline: float) -> bool:
-    url = _url(driver)
-    if "consent.google" not in url and "/consent" not in url:
+    if "consent.google" not in _url(driver) and "/consent" not in _url(driver):
         return False
     log("    [!] google consent page")
-    for _ in range(3):
+    for _ in range(2):
         if budget_left(deadline) <= 0:
             break
         for sel in ("#L2AGLb", "button#L2AGLb"):
@@ -833,58 +883,149 @@ def handle_google_consent(driver, deadline: float) -> bool:
                 for el in driver.find_elements(By.CSS_SELECTOR, sel):
                     if el.is_displayed():
                         el.click()
-                        time.sleep(2.5)
+                        time.sleep(2.0)
                         return True
             except Exception:
                 pass
         try:
             for el in driver.find_elements(By.CSS_SELECTOR, "button, div[role=button]"):
-                txt = (el.text or "").strip().lower()
-                if txt in ("accept all", "accept all cookies", "agree", "i agree",
-                           "alle akzeptieren", "alles accepteren", "tout accepter"):
+                if (el.text or "").strip().lower() in (
+                        "accept all", "accept all cookies", "agree", "i agree",
+                        "alle akzeptieren", "alles accepteren", "tout accepter"):
                     if el.is_displayed():
                         el.click()
-                        time.sleep(2.5)
+                        time.sleep(2.0)
                         return True
         except Exception:
             pass
-        time.sleep(1.5)
+        time.sleep(1.2)
     return False
 
 
-def handle_google_interstitial(driver, deadline: float) -> bool:
-    if "/sorry/" not in _url(driver):
-        return False
-    log("    [!] google /sorry/ interstitial")
-    for _ in range(5):
-        if budget_left(deadline) <= 0:
-            break
+def _click_recaptcha(driver) -> bool:
+    """The checkbox lives INSIDE an iframe - must switch in."""
+    clicked = False
+    try:
+        frames = driver.find_elements(
+            By.CSS_SELECTOR, 'iframe[src*="recaptcha"], iframe[title*="reCAPTCHA"]')
+    except Exception:
+        frames = []
+
+    for f in frames:
         try:
-            for a in driver.find_elements(By.CSS_SELECTOR, "#recaptcha-anchor, .recaptcha-checkbox"):
-                if a.is_displayed():
-                    a.click()
-                    time.sleep(2.0)
+            driver.switch_to.frame(f)
+        except Exception:
+            continue
+        try:
+            for sel in ("#recaptcha-anchor", ".recaptcha-checkbox-border",
+                        ".recaptcha-checkbox", "span[role=checkbox]"):
+                for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                    try:
+                        if el.is_displayed():
+                            el.click()
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+                if clicked:
                     break
         except Exception:
             pass
+        finally:
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+        if clicked:
+            break
+    return clicked
+
+
+def solve_sorry(driver, deadline: float) -> bool:
+    """Solve Google's /sorry/ abuse wall. Frame-aware, then re-target."""
+    if "/sorry/" not in _url(driver):
+        return True
+
+    log("    [!] google /sorry/ - solving captcha")
+    for attempt in range(3):
+        if budget_left(deadline) <= 0:
+            break
+        if _click_recaptcha(driver):
+            log("    [.] captcha checkbox clicked")
+        time.sleep(2.5)
+
+        if "/sorry/" not in _url(driver):
+            log("    [+] /sorry/ cleared")
+            return True
+
+        # a challenge grid may be showing - try the verify button
         try:
-            for b in driver.find_elements(By.CSS_SELECTOR, "input[type=submit], button"):
-                if b.is_displayed() and (b.get_attribute("value") or b.text or "").strip():
+            for b in driver.find_elements(
+                    By.CSS_SELECTOR, "#recaptcha-verify-button, button"):
+                if b.is_displayed() and "verify" in (b.text or "").lower():
                     b.click()
                     time.sleep(2.0)
                     break
         except Exception:
             pass
+
         if "/sorry/" not in _url(driver):
+            log("    [+] /sorry/ cleared")
             return True
-        time.sleep(1.5)
+
+    # last resort: jump straight to the continue= target
+    try:
+        m = re.search(r"[?&]continue=([^&]+)", _url(driver))
+        if m:
+            target = unquote(unquote(m.group(1)))
+            if target.startswith("http"):
+                _fast_get(driver, target, cap=8)
+                if "/sorry/" not in _url(driver):
+                    log("    [+] /sorry/ bypassed via continue=")
+                    return True
+    except Exception:
+        pass
+
     return "/sorry/" not in _url(driver)
 
 
-def _wait_for_serp(driver, deadline: float, timeout: float = 10.0) -> int:
+def google_health_check(driver, deadline: float) -> bool:
+    """Prove Google works from this route before spending the run on it."""
+    log("[*] google health check")
+    _fast_get(driver, "https://www.google.com/ncr", cap=8)
+
+    if _is_error_page(driver):
+        log("    [!] google unreachable (error page)")
+        _fast_get(driver, "https://www.google.com/", cap=8)
+        if _is_error_page(driver):
+            log("    [!] google still unreachable")
+            return False
+
+    if "/sorry/" in _url(driver):
+        solve_sorry(driver, deadline)
+
+    probe = f"https://www.google.com/search?q={quote('abdulsamad')}&hl=en&num=10"
+    _fast_get(driver, probe, cap=8)
+
+    if _is_error_page(driver):
+        log("    [!] search page failed to load")
+        return False
+
+    if "/sorry/" in _url(driver):
+        solve_sorry(driver, deadline)
+        _fast_get(driver, probe, cap=8)
+
+    ok = "/sorry/" not in _url(driver) and not _is_error_page(driver)
+    log(f"    [{' +' if ok else '!'}] google usable: {ok}")
+    return ok
+
+
+def _wait_for_serp(driver, deadline: float, timeout: float = 8.0) -> int:
     end = min(time.time() + timeout, deadline)
     last = 0
     while time.time() < end:
+        if _is_error_page(driver):
+            return 0
         try:
             n = int(js(driver, "return document.querySelectorAll('a[href]').length") or 0)
             last = n
@@ -892,7 +1033,7 @@ def _wait_for_serp(driver, deadline: float, timeout: float = 10.0) -> int:
                 return last
         except Exception:
             pass
-        time.sleep(0.6)
+        time.sleep(0.5)
     return last
 
 
@@ -902,23 +1043,20 @@ def dump_serp(driver, tag: str) -> dict:
         info = js(driver, """
             const a = Array.from(document.querySelectorAll('a[href]'));
             return {
-              url: location.href,
-              title: document.title,
+              url: (location.href || '').slice(0, 90),
+              title: (document.title || '').slice(0, 50),
               anchors: a.length,
               hasSearch: !!document.querySelector('#search'),
-              hasRso: !!document.querySelector('#rso'),
-              hasL2AGLb: !!document.querySelector('#L2AGLb'),
               textLen: document.body ? document.body.innerText.length : 0
             };
         """) or {}
     except Exception:
         pass
-    log(f"    [diag:{tag}] {json.dumps(info)[:300]}")
+    log(f"    [diag:{tag}] {json.dumps(info)[:260]}")
     return info
 
 
 def find_site_link(driver):
-    """First visible SERP anchor pointing at our site."""
     try:
         links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
     except Exception:
@@ -941,8 +1079,6 @@ def find_site_link(driver):
 
 
 def viewport_scroll_to(driver, el) -> None:
-    """Gradually scroll the element into the viewport - this is what makes
-    Google register the result as seen (i.e. an impression)."""
     try:
         target = js(driver,
                     "return arguments[0].getBoundingClientRect().top + window.scrollY - 140;",
@@ -959,23 +1095,18 @@ def viewport_scroll_to(driver, el) -> None:
         cur = float(js(driver, "return window.scrollY") or 0)
     except Exception:
         cur = 0.0
-    steps = 6
-    for i in range(1, steps + 1):
+    for i in range(1, 7):
         try:
-            js(driver, "window.scrollTo(0, arguments[0]);", cur + (target - cur) * i / steps)
+            js(driver, "window.scrollTo(0, arguments[0]);", cur + (target - cur) * i / 6)
         except Exception:
             break
         time.sleep(random.uniform(0.15, 0.35))
 
 
 def impression_pass(driver, deadline: float, force_click: bool = False) -> dict:
-    """One Google query -> one potential impression.
-
-    Loads the SERP, finds our result, scrolls it into the viewport and dwells.
-    That render is what Search Console records as an impression. Optionally
-    clicks through, which turns it into a view (and maybe an ad click).
-    """
-    result = {"query": None, "impression": False, "clicked": False, "ad_clicked": False}
+    """One Google query -> one potential impression."""
+    result = {"query": None, "impression": False, "clicked": False,
+              "ad_clicked": False, "loaded": False}
 
     if not QUERY_POOL:
         return result
@@ -984,61 +1115,60 @@ def impression_pass(driver, deadline: float, force_click: bool = False) -> dict:
     result["query"] = query
     host = random.choice(GOOGLE_HOSTS)
 
-    for start in (0, 20):
-        if budget_left(deadline) <= 0:
+    url = (f"https://{host}/search?q={quote(query)}"
+           f"&hl=en&gl=us&num=20&pws=0")
+
+    _fast_get(driver, url, cap=8)
+
+    if _is_error_page(driver):
+        _fast_get(driver, url, cap=6)
+        if _is_error_page(driver):
+            log(f"    [!] '{query[:26]}' load failed on {host}")
             return result
 
-        url = (f"https://{host}/search?q={quote(query)}"
-               f"&hl=en&gl=us&num=30&pws=0&start={start}")
-        _fast_get(driver, url, cap=10)
-        handle_google_consent(driver, deadline)
-        handle_google_interstitial(driver, deadline)
+    handle_google_consent(driver, deadline)
+    if "/sorry/" in _url(driver):
+        solve_sorry(driver, deadline)
 
-        n = _wait_for_serp(driver, deadline)
-        if start == 0:
-            dump_serp(driver, f"imp:{query[:22]}")
-
-        if n <= 3:
-            continue
-
-        el = find_site_link(driver)
-        if el is None:
-            if start == 0:
-                continue          # try page 2 before giving up
-            log(f"    [.] '{query[:34]}' not found on {host}")
-            return result
-
-        # ---- the impression itself ----
-        viewport_scroll_to(driver, el)
-        time.sleep(random.uniform(2.0, 5.0))
-        result["impression"] = True
-        log(f"    [+] IMPRESSION '{query[:34]}' on {host}")
-
-        # ---- optional click-through ----
-        if force_click or random.random() < CLICK_THROUGH_RATE:
-            x, y = elem_point(driver, el)
-            if x is not None:
-                cdp_move(driver, x, y)
-            try:
-                el.click()
-            except Exception:
-                try:
-                    driver.get(el.get_attribute("href"))
-                except Exception:
-                    return result
-            time.sleep(2.0)
-            if SITE_FRAG in _url(driver):
-                result["clicked"] = True
-                log(f"    [+] click-through -> {_url(driver)[:70]}")
-                time.sleep(random.uniform(1.0, 2.5))
-                human_scroll(driver)
-                time.sleep(random.uniform(1.5, 3.5))
-                if random.random() < AD_CLICK_RATE and ads_available(driver):
-                    if click_one_ad(driver, deadline):
-                        result["ad_clicked"] = True
-                        log("    [+] AD CLICKED (from impression pass)")
+    n = _wait_for_serp(driver, deadline)
+    if n <= 3:
+        dump_serp(driver, f"x:{query[:18]}")
         return result
 
+    result["loaded"] = True
+    el = find_site_link(driver)
+
+    if el is None:
+        dump_serp(driver, f"nf:{query[:16]}")
+        return result
+
+    viewport_scroll_to(driver, el)
+    time.sleep(random.uniform(2.0, 4.5))
+    result["impression"] = True
+    log(f"    [+] IMPRESSION '{query[:32]}' on {host}")
+
+    if force_click or random.random() < CLICK_THROUGH_RATE:
+        x, y = elem_point(driver, el)
+        if x is not None:
+            cdp_move(driver, x, y)
+        try:
+            el.click()
+        except Exception:
+            try:
+                driver.get(el.get_attribute("href"))
+            except Exception:
+                return result
+        time.sleep(2.0)
+        if SITE_FRAG in _url(driver):
+            result["clicked"] = True
+            log(f"    [+] click-through -> {_url(driver)[:60]}")
+            time.sleep(random.uniform(1.0, 2.5))
+            human_scroll(driver)
+            time.sleep(random.uniform(1.5, 3.0))
+            if random.random() < AD_CLICK_RATE and ads_available(driver):
+                if click_one_ad(driver, deadline):
+                    result["ad_clicked"] = True
+                    log("    [+] AD CLICKED (impression pass)")
     return result
 
 
@@ -1177,7 +1307,7 @@ def warmup(driver, deadline: float) -> None:
             return
         open_page(driver, path, deadline)
         human_scroll(driver)
-        time.sleep(random.uniform(2, 5))
+        time.sleep(random.uniform(2, 4))
 
 
 # ---------------------------------------------------------------------------
@@ -1186,7 +1316,7 @@ def warmup(driver, deadline: float) -> None:
 SUMMARY = {
     "run_id": RUN_ID,
     "started_utc": datetime.now(timezone.utc).isoformat(),
-    "route": None, "identity": None,
+    "route": None, "identity": None, "google_ok": None,
     "clicks": 0, "views": 0, "impressions": 0, "google_entry": False,
     "targets": {"clicks": TARGET_CLICKS, "views": TARGET_VIEWS,
                 "impressions": TARGET_IMPRESSIONS,
@@ -1253,9 +1383,15 @@ def main() -> int:
         vpn_countries |= {"JP", "KR"}
         log("[*] note: VPN_COUNTRIES missing JP/KR, auto-fixed")
 
-    ident = build_identity()
-    SUMMARY["identity"] = {"cc": ident["cc"], "tz": ident["tz"], "ua": ident["ua"]}
-    log(f"[*] identity: {ident['cc']} {ident['tz']} chrome/{CHROME_MAJOR}")
+    # one profile per day -> the /sorry/ exemption cookie is reused all day
+    ident_id = state.get("identity_id")
+    if not ident_id:
+        ident_id = random.randint(1, 5)
+        state["identity_id"] = ident_id
+        save_state(state)
+    ident = build_identity(ident_id)
+    SUMMARY["identity"] = {"id": ident_id, "cc": ident["cc"], "tz": ident["tz"]}
+    log(f"[*] identity: id={ident_id} {ident['cc']} {ident['tz']} chrome/{CHROME_MAJOR}")
 
     driver = None
     vpn_proc = None
@@ -1283,39 +1419,41 @@ def main() -> int:
                 log(f"    [*] vpn try {tries}/{VPN_MAX_TRIES}: {server['cc']} "
                     f"{server['ip']} ping={server['ping']:.0f} sessions={server['sessions']}")
                 vpn_proc = start_vpn(server)
-                if wait_for_tunnel(vpn_proc, attempt_deadline):
-                    try:
-                        driver = build_driver(ident, None)
-                        route = "2-vpn"
-                        log(f"    [+] tunnel up via {server['cc']}")
-                        break
-                    except Exception as e:
-                        log(f"    [!] chrome over vpn failed: {e}")
-                        stop_vpn(vpn_proc)
-                        vpn_proc = None
-                else:
+                if not wait_for_tunnel(vpn_proc, attempt_deadline):
                     log(f"    [!] vpn {server['cc']} no tunnel: {vpn_tail(3)}")
+                    stop_vpn(vpn_proc)
+                    vpn_proc = None
+                    continue
+
+                ip = tunnel_has_egress(vpn_deadline)
+                if not ip:
+                    log(f"    [!] vpn {server['cc']} tunnel up but no egress")
+                    stop_vpn(vpn_proc)
+                    vpn_proc = None
+                    continue
+
+                try:
+                    driver = build_driver(ident, None)
+                    route = "2-vpn"
+                    log(f"    [+] tunnel up via {server['cc']} (exit {ip})")
+                    break
+                except Exception as e:
+                    log(f"    [!] chrome over vpn failed: {e}")
                     stop_vpn(vpn_proc)
                     vpn_proc = None
 
         if driver is None:
             proxy_deadline = time.time() + PROXY_BUDGET
-            log(f"[*] tier 3: proxy pool (budget {PROXY_BUDGET}s)")
+            log(f"[*] tier 3: proxy pool (budget {PROXY_BUDGET}s, preflight {PROXY_PREFLIGHT})")
             pool3 = ProxyPool(prefer=(ident["cc"], "US", "GB", "DE", "NL"))
             pool3.load(proxy_deadline)
-            for _ in range(3):
-                if budget_left(proxy_deadline) <= 0:
-                    break
-                cand = pool3.next()
-                if not cand:
-                    break
-                log(f"    [*] proxy try: {cand['addr']} ({cand['cc']})")
+            cand = pool3.next_alive(proxy_deadline, tries=PROXY_PREFLIGHT)
+            if cand:
                 try:
                     driver = build_driver(ident, cand["addr"])
                     route = "3-proxy"
-                    break
                 except Exception as e:
-                    log(f"    [!] proxy failed: {e}")
+                    log(f"    [!] chrome over proxy failed: {e}")
                     driver = None
 
         if driver is None:
@@ -1327,6 +1465,7 @@ def main() -> int:
         log(f"[+] route = {route}")
 
         session_deadline = DEADLINE - 15
+        phase1_deadline = min(session_deadline, time.time() + PHASE1_MAX_SECONDS)
 
         impressions = 0
         clicks = 0
@@ -1334,47 +1473,69 @@ def main() -> int:
         pages_done = 0
         ad_seen = False
 
+        google_ok = google_health_check(driver, phase1_deadline)
+        SUMMARY["google_ok"] = google_ok
+
         # ================= PHASE 1: IMPRESSIONS =================
-        log(f"[*] phase 1: impressions (target {TARGET_IMPRESSIONS})")
-        first = impression_pass(driver, session_deadline, force_click=True)
-        if first["impression"]:
-            impressions += 1
-            state["impressions"] = state.get("impressions", 0) + 1
-        if first["clicked"]:
-            views += 1
-            state["views"] = state.get("views", 0) + 1
-            SUMMARY["google_entry"] = True
-        if first["ad_clicked"]:
-            clicks += 1
-            state["clicks"] = state.get("clicks", 0) + 1
-            ad_seen = True
-        save_state(state)
+        if google_ok:
+            log(f"[*] phase 1: impressions (target {TARGET_IMPRESSIONS})")
+            fails = 0
+            passes = 0
 
-        if not first["clicked"]:
-            open_page(driver, "/", session_deadline)
-            warmup(driver, session_deadline)
-
-        passes = 1
-        while (impressions < TARGET_IMPRESSIONS
-               and passes < MAX_IMPRESSION_PASSES
-               and budget_left(session_deadline) > 40):
-            r = impression_pass(driver, session_deadline)
+            first = impression_pass(driver, phase1_deadline, force_click=True)
             passes += 1
-            if r["impression"]:
+            if first["impression"]:
                 impressions += 1
                 state["impressions"] = state.get("impressions", 0) + 1
-            if r["clicked"]:
+            if first["clicked"]:
                 views += 1
                 state["views"] = state.get("views", 0) + 1
-            if r["ad_clicked"]:
+                SUMMARY["google_entry"] = True
+            if first["ad_clicked"]:
                 clicks += 1
                 state["clicks"] = state.get("clicks", 0) + 1
                 ad_seen = True
             save_state(state)
-            SUMMARY.update(impressions=impressions, views=views, clicks=clicks)
 
-        log(f"[*] phase 1 done: impressions={impressions} views={views} "
-            f"clicks={clicks} passes={passes}")
+            if not first["clicked"]:
+                open_page(driver, "/", session_deadline)
+                warmup(driver, session_deadline)
+
+            while (impressions < TARGET_IMPRESSIONS
+                   and passes < MAX_IMPRESSION_PASSES
+                   and budget_left(phase1_deadline) > 15):
+                r = impression_pass(driver, phase1_deadline)
+                passes += 1
+
+                if r["impression"]:
+                    impressions += 1
+                    state["impressions"] = state.get("impressions", 0) + 1
+                    fails = 0
+                elif r["loaded"]:
+                    fails = 0
+                else:
+                    fails += 1
+
+                if r["clicked"]:
+                    views += 1
+                    state["views"] = state.get("views", 0) + 1
+                if r["ad_clicked"]:
+                    clicks += 1
+                    state["clicks"] = state.get("clicks", 0) + 1
+                    ad_seen = True
+                save_state(state)
+                SUMMARY.update(impressions=impressions, views=views, clicks=clicks)
+
+                if fails >= GOOGLE_FAIL_LIMIT:
+                    log(f"[!] {fails} google failures in a row - ending phase 1")
+                    break
+
+            log(f"[*] phase 1 done: impressions={impressions} views={views} "
+                f"clicks={clicks} passes={passes}")
+        else:
+            log("[!] google unusable - skipping phase 1, going straight to views")
+            open_page(driver, "/", session_deadline)
+            warmup(driver, session_deadline)
 
         # ================= PHASE 2: TOP UP VIEWS/CLICKS =================
         log("[*] phase 2: top up views/clicks")
