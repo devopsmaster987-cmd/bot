@@ -52,9 +52,9 @@ TRIGGER_UTC = os.environ.get("TRIGGER_UTC", "")
 
 VIEWS_PER_RUN    = int(os.environ.get("VIEWS_PER_RUN", "3"))
 IDENTITY_COUNT   = int(os.environ.get("IDENTITY_COUNT", "5"))
-MAX_RUN_SECONDS  = int(os.environ.get("MAX_RUN_SECONDS", "215"))
+MAX_RUN_SECONDS  = int(os.environ.get("MAX_RUN_SECONDS", "175"))
 VPN_MAX_TRIES    = int(os.environ.get("VPN_MAX_TRIES", "2"))
-ROUTE_BUDGET     = int(os.environ.get("ROUTE_BUDGET", "80"))
+ROUTE_BUDGET     = int(os.environ.get("ROUTE_BUDGET", "60"))
 USE_GOOGLE_ENTRY = os.environ.get("USE_GOOGLE_ENTRY", "true").lower() in ("1", "true", "yes")
 
 DEFAULT_VPN_COUNTRIES = (
@@ -666,10 +666,10 @@ def ip_country(ip, timeout=6):
 
 
 def _extract_config(parts):
-    """VPN Gate's config is the last field. Try the last two, validate."""
-    for cand in (parts[-1], parts[-2] if len(parts) > 1 else ""):
+    """Scan fields for a long base64 blob that decodes to an openvpn config."""
+    for cand in reversed(parts):
         cand = cand.strip()
-        if not cand:
+        if len(cand) < 60 or not re.fullmatch(r"[A-Za-z0-9+/=]+", cand):
             continue
         try:
             cfg = base64.b64decode(cand).decode("utf-8", "ignore")
@@ -685,7 +685,7 @@ def _extract_country(parts):
     CountryShort is a 2-letter uppercase code. CountryLong can contain a
     comma (e.g. 'Korea, Republic of'), so never trust a fixed index.
     """
-    for p in parts[5:13]:
+    for p in parts[5:12]:
         t = p.strip()
         if re.fullmatch(r"[A-Z]{2}", t):
             return t
@@ -704,17 +704,19 @@ def fetch_vpngate(countries):
         return out
 
     total = 0
+    no_cc = 0
     bad_cfg = 0
     for line in text.splitlines():
         if not line or line.startswith("*") or line.startswith("#"):
             continue
         parts = line.split(",")
-        if len(parts) < 14:
+        if len(parts) < 12:
             continue
         total += 1
 
         cc = _extract_country(parts)
         if not cc:
+            no_cc += 1
             continue
         if countries and cc not in countries:
             continue
@@ -730,19 +732,22 @@ def fetch_vpngate(countries):
             score = 0
         out.append((cc, parts[1].strip(), score, cfg))
 
-    out.sort(key=lambda t: t[2], reverse=True)
+    # UDP handshakes far faster than TCP on these hosts
+    out.sort(key=lambda t: (0 if "proto udp" in t[3] else 1, -t[2]))
 
     if out:
         counts = {}
         for cc, _, _, _ in out:
             counts[cc] = counts.get(cc, 0) + 1
         top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
-        log(f"[*] VPN Gate: {len(out)} usable of {total} parsed, {len(counts)} countries "
-            f"(top: {', '.join(f'{c}x{n}' for c, n in top)})")
-        if bad_cfg:
-            log(f"[*] VPN Gate: {bad_cfg} lines had unreadable configs")
+        udp = sum(1 for t in out if "proto udp" in t[3])
+        log(f"[*] VPN Gate: {len(out)} usable of {total} parsed, {len(counts)} countries, "
+            f"{udp} udp (top: {', '.join(f'{c}x{n}' for c, n in top)})")
+        if no_cc or bad_cfg:
+            log(f"[*] VPN Gate: skipped {no_cc} no-country, {bad_cfg} bad-config")
     else:
-        log(f"[!] VPN Gate: 0 usable of {total} parsed ({bad_cfg} bad configs)")
+        log(f"[!] VPN Gate: 0 usable of {total} parsed "
+            f"({no_cc} no-country, {bad_cfg} bad-config)")
 
     return out
 
@@ -762,7 +767,7 @@ def vpn_connect(countries=VPN_COUNTRIES):
                 spread.append(by_cc[cc][i])
 
     for cc, ip, score, raw in spread[:VPN_MAX_TRIES]:
-        if route_time_left() < 20:
+        if route_time_left() < 18:
             log(f"[!] route budget hit ({route_time_left():.0f}s left), stopping VPN tries")
             break
 
@@ -773,7 +778,6 @@ def vpn_connect(countries=VPN_COUNTRIES):
             if s.startswith("auth-user-pass") or s.startswith("verb "):
                 continue
             lines.append(ln)
-        # VPN Gate expects literal vpn/vpn credentials
         lines.append(f"auth-user-pass {VPN_CREDS}")
         if not any(l.strip().startswith("comp-lzo") for l in lines):
             lines.append("comp-lzo")
@@ -784,6 +788,7 @@ def vpn_connect(countries=VPN_COUNTRIES):
         with open(cfg_path, "w") as f:
             f.write("\n".join(lines) + "\n")
 
+        proto = "udp" if "proto udp" in raw else "tcp"
         log_path = os.path.join(TMP, "openvpn.log")
         try:
             lf = open(log_path, "w")
@@ -794,7 +799,7 @@ def vpn_connect(countries=VPN_COUNTRIES):
             continue
 
         ok = False
-        for _ in range(12):
+        for _ in range(10):
             time.sleep(1.3)
             ip_now = current_ip(timeout=4)
             if ip_now and ip_now != ROUTE_USED["runner_ip"]:
@@ -802,7 +807,7 @@ def vpn_connect(countries=VPN_COUNTRIES):
                 if cc_now:
                     ROUTE_USED.update(ip=ip_now, country=cc_now)
                     VPN_STATE.update(ok=True, server=ip, country=cc_now)
-                    log(f"[+] VPN up {cc}/{ip} -> exit {ip_now} ({cc_now})")
+                    log(f"[+] VPN up {cc}/{ip} ({proto}) -> exit {ip_now} ({cc_now})")
                     ok = True
                     break
 
@@ -815,13 +820,13 @@ def vpn_connect(countries=VPN_COUNTRIES):
             interesting = [l for l in all_lines if any(
                 k in l for k in ("AUTH", "TLS Error", "PUSH", "ERROR",
                                  "SIGTERM", "Connection reset", "Inactivity"))]
-            tail = interesting[-4:] if interesting else all_lines[-4:]
-            log(f"[!] VPN failed {cc}/{ip}: " + (" | ".join(tail) if tail else "(no output)"))
+            tail = interesting[-3:] if interesting else all_lines[-3:]
+            log(f"[!] VPN failed {cc}/{ip} ({proto}): " + (" | ".join(tail) if tail else "(no output)"))
         except Exception:
-            log(f"[!] VPN failed {cc}/{ip}: (log unreadable)")
+            log(f"[!] VPN failed {cc}/{ip} ({proto}): (log unreadable)")
 
         subprocess.run(["sudo", "pkill", "-f", "openvpn"], timeout=8)
-        time.sleep(0.8)
+        time.sleep(0.6)
 
     return False
 
@@ -846,10 +851,10 @@ class ProxyPool:
         head, tail = [], []
 
         for url in country_srcs:
-            if route_time_left() < 15:
+            if route_time_left() < 12:
                 break
             try:
-                r = requests.get(url, timeout=8)
+                r = requests.get(url, timeout=7)
                 for ln in r.text.splitlines():
                     ln = ln.strip()
                     if ln and ":" in ln and ln not in seen:
@@ -859,10 +864,10 @@ class ProxyPool:
                 continue
 
         for url in bulk_srcs:
-            if route_time_left() < 10:
+            if route_time_left() < 8:
                 break
             try:
-                r = requests.get(url, timeout=8)
+                r = requests.get(url, timeout=7)
                 for ln in r.text.splitlines():
                     ln = ln.strip()
                     if ln and ":" in ln and re.match(r"^\d{1,3}(\.\d{1,3}){3}:", ln) and ln not in seen:
@@ -894,7 +899,7 @@ class ProxyPool:
         prefer = tuple(p.upper() for p in prefer)
         fallback = None
         for proxy in self.items[:max_tries]:
-            if route_time_left() < 6:
+            if route_time_left() < 5:
                 break
             res = self.check(proxy)
             if not res:
@@ -1109,7 +1114,7 @@ def maybe_tab_switch(driver):
 
 
 def dwell(driver, lo, hi):
-    end = min(time.time() + random.uniform(lo, hi), time.time() + max(2, time_left() - 14))
+    end = min(time.time() + random.uniform(lo, hi), time.time() + max(2, time_left() - 12))
     while time.time() < end and not STOP:
         r = random.random()
         if r < 0.55:
@@ -1216,7 +1221,7 @@ def enter_via_google(driver, term=None):
     log(f"    [*] google entry attempt via google.{tld}")
 
     for q in candidates:
-        if time_left() < 35:
+        if time_left() < 30:
             log("    [!] google entry: out of budget")
             break
 
@@ -1492,14 +1497,14 @@ def main():
         if kind == "click":
             result["clicks"] += 1
 
-        while len(result["urls"]) < views and time_left() > 40 and not STOP:
+        while len(result["urls"]) < views and time_left() > 35 and not STOP:
             url = random.choice(LANDING_URLS)
             log(f"[*] extra view -> {url} | left {time_left():.0f}s")
             try:
-                _fast_get(driver, url, timeout=25)
+                _fast_get(driver, url, timeout=22)
                 time.sleep(random.uniform(1.0, 2.0))
                 scroll_burst(driver, random.uniform(1.5, 3.5))
-                dwell(driver, 5, 12)
+                dwell(driver, 5, 11)
                 result["views"] += 1
                 result["urls"].append(url)
             except Exception as e:
@@ -1510,12 +1515,7 @@ def main():
         log(f"[!] fatal: {e}")
         result["errors"].append(str(e)[:140])
     finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
-
+        # write the summary BEFORE quitting, so a SIGKILL cannot lose it
         result.update({
             "run": RUN_NUMBER, "utc": now.isoformat(), "slot": slot_index(now),
             "route": ROUTE_USED, "vpn_ok": VPN_STATE["ok"], "identity": fp["profile"],
@@ -1535,6 +1535,12 @@ def main():
         for e in result["errors"]:
             log(f"    [!] {e}")
         log("=" * 68)
+
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
