@@ -3,11 +3,11 @@
 """
 smoke.py - anti-detection AdSense traffic bot for abdulsamad.shop
 
-Runs as the normal user (no root). openvpn is elevated with `sudo -n`, which
-fails fast instead of hanging on a password prompt.
-
-VPN nodes are ranked by session count first, ping second - a full node returns
-AUTH_FAILED regardless of how attractive its ping looks.
+VPN selection
+  Ranked by SESSION COUNT, not VPN Gate's score. Score tracks popularity, and
+  popular nodes are full - which is exactly what returns AUTH_FAILED.
+  A VPN_MAX_SESSIONS filter plus /24 subnet diversity keeps attempts spread
+  across the network instead of hammering one crowded cluster.
 
 Phases
   1. IMPRESSIONS via Google (skipped if google_health_check fails)
@@ -94,9 +94,10 @@ DAILY_RUN_TARGET = int(os.environ.get(
     "DAILY_RUN_TARGET", str(max(DAILY_CLICK_TARGET // max(TARGET_CLICKS, 1), 1))))
 RUNS_PER_DAY = int(os.environ.get("RUNS_PER_DAY", "104"))
 
-VPN_BUDGET = int(os.environ.get("VPN_BUDGET", "120"))
-VPN_TRY_TIMEOUT = int(os.environ.get("VPN_TRY_TIMEOUT", "22"))
-VPN_MAX_TRIES = int(os.environ.get("VPN_MAX_TRIES", "5"))
+VPN_BUDGET = int(os.environ.get("VPN_BUDGET", "130"))
+VPN_TRY_TIMEOUT = int(os.environ.get("VPN_TRY_TIMEOUT", "16"))
+VPN_MAX_TRIES = int(os.environ.get("VPN_MAX_TRIES", "8"))
+VPN_MAX_SESSIONS = int(os.environ.get("VPN_MAX_SESSIONS", "120"))
 PROXY_BUDGET = int(os.environ.get("PROXY_BUDGET", "45"))
 PROXY_PREFLIGHT = int(os.environ.get("PROXY_PREFLIGHT", "5"))
 
@@ -507,32 +508,48 @@ def fetch_vpngate(wanted: set[str]) -> list[dict]:
         servers.append({"cc": cc, "ip": parts[1].strip(), "ping": ping,
                         "score": score, "sessions": sessions, "config": cfg})
 
-    servers.sort(key=vpn_quality_key)
     log(f"[*] vpngate: {len(servers)} usable of {total} parsed")
     return servers
 
 
 def vpn_quality_key(s: dict) -> float:
-    """Lower is better. Session count dominates: a full node returns AUTH_FAILED
-    however attractive its ping looks."""
-    sess = s["sessions"] if s["sessions"] > 0 else 6   # 0 usually means stale
-    return (sess * 1.0) + (s["ping"] * 0.5) - (s["score"] * 0.003)
+    """Session count dominates. Score is deliberately excluded - it tracks
+    popularity, and popular nodes are the full ones that return AUTH_FAILED."""
+    sess = s["sessions"] if s["sessions"] > 0 else 8   # 0 usually means stale
+    return (sess * 2.0) + (s["ping"] * 0.5)
 
 
 def pick_vpn_candidates(servers: list[dict], n: int) -> list[dict]:
-    ordered = sorted(servers, key=vpn_quality_key)
-    top = ordered[:max(n * 3, 10)]
-    rng = random.Random(int(time.time() // 300))
-    rng.shuffle(top)
+    """Low-load servers first, then spread across /24 subnets so we stop
+    retrying the same crowded cluster."""
+    if not servers:
+        return []
 
-    picked, seen_cc = [], set()
-    for s in top:
-        if s["cc"] not in seen_cc:
-            picked.append(s)
-            seen_cc.add(s["cc"])
+    low = [s for s in servers if 0 < s["sessions"] <= VPN_MAX_SESSIONS]
+    base = low if len(low) >= max(n, 3) else servers
+
+    ordered = sorted(base, key=vpn_quality_key)
+
+    # shuffle inside coarse quality tiers so consecutive runs vary
+    rng = random.Random(int(time.time() // 300))
+    tiers: dict[int, list] = {}
+    for s in ordered[:60]:
+        tiers.setdefault(int(vpn_quality_key(s) // 25), []).append(s)
+    seq: list[dict] = []
+    for t in sorted(tiers):
+        rng.shuffle(tiers[t])
+        seq.extend(tiers[t])
+
+    picked, seen_net = [], set()
+    for s in seq:                                  # pass 1: one per /24
+        net = s["ip"].rsplit(".", 1)[0]
+        if net in seen_net:
+            continue
+        picked.append(s)
+        seen_net.add(net)
         if len(picked) >= n:
             return picked
-    for s in top:
+    for s in seq:                                  # pass 2: fill
         if s not in picked:
             picked.append(s)
         if len(picked) >= n:
@@ -563,7 +580,7 @@ def write_vpn_config(server: dict) -> str:
     return path
 
 
-def vpn_tail(n: int = 5) -> str:
+def vpn_tail(n: int = 4) -> str:
     try:
         size = os.path.getsize(VPN_LOG)
     except Exception:
@@ -573,10 +590,11 @@ def vpn_tail(n: int = 5) -> str:
     try:
         with open(VPN_LOG, "r", errors="ignore") as fh:
             lines = [ln for ln in fh.read().splitlines() if ln.strip()]
-        # drop the noisy compression warnings so the real error is visible
-        useful = [ln for ln in lines if "Compression" not in ln and "compression" not in ln]
+        useful = [ln for ln in lines
+                  if "Compression" not in ln and "compression" not in ln
+                  and "PUSH_REQUEST" not in ln]
         src = useful or lines
-        return " | ".join(src[-n:])[:400]
+        return " | ".join(src[-n:])[:300]
     except Exception as e:
         return f"<unreadable: {e}>"
 
@@ -594,7 +612,6 @@ def start_vpn(server: dict):
     proc = subprocess.Popen(cmd, stdout=logfh, stderr=subprocess.STDOUT,
                             stdin=subprocess.DEVNULL)
     proc._logfh = logfh
-    log(f"      cmd: {' '.join(cmd)}")
     return proc
 
 
@@ -605,41 +622,30 @@ FATAL_MARKERS = (
     "Cannot open TUN",
     "Cannot ioctl TUNSETIFF",
     "Permission denied",
-    "ERROR: Cannot open TUN/TAP",
 )
 
 
 def wait_for_tunnel(proc, deadline: float) -> bool:
-    saw_output = False
     while budget_left(deadline) > 0:
         if proc.poll() is not None and proc.returncode != 0:
             return False
-
         try:
             with open(VPN_LOG, "r", errors="ignore") as fh:
                 txt = fh.read()
         except Exception:
-            time.sleep(0.7)
+            time.sleep(0.6)
             continue
-
-        if txt and not saw_output:
-            saw_output = True
-            log(f"      openvpn started writing ({len(txt)}B)")
-
         if "Initialization Sequence Completed" in txt:
             return True
-
         for m in FATAL_MARKERS:
             if m in txt:
-                log(f"      openvpn fatal: {m}")
                 return False
-
-        time.sleep(0.7)
+        time.sleep(0.6)
     return False
 
 
 def tunnel_has_egress(deadline: float) -> str | None:
-    end = min(time.time() + 12, deadline)
+    end = min(time.time() + 10, deadline)
     while time.time() < end:
         try:
             r = requests.get("https://api.ipify.org", timeout=6)
@@ -656,7 +662,8 @@ def _kill_pid(pid: int) -> None:
         if IS_ROOT:
             os.kill(pid, signal.SIGTERM)
         else:
-            subprocess.run(["sudo", "-n", "kill", str(pid)], timeout=10)
+            subprocess.run(["sudo", "-n", "kill", str(pid)],
+                           timeout=10, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
@@ -664,15 +671,16 @@ def _kill_pid(pid: int) -> None:
 def stop_vpn(proc) -> None:
     if not proc:
         return
-    _kill_pid(proc.pid)
-    try:
-        proc.terminate()
-        proc.wait(timeout=6)
-    except Exception:
+    if proc.poll() is None:              # only kill a live process
+        _kill_pid(proc.pid)
         try:
-            proc.kill()
+            proc.terminate()
+            proc.wait(timeout=5)
         except Exception:
-            pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
     try:
         if getattr(proc, "_logfh", None):
             proc._logfh.close()
@@ -980,8 +988,6 @@ def handle_google_consent(driver, deadline: float) -> bool:
 
 
 def _click_recaptcha(driver) -> bool:
-    """Real mouse click on the reCAPTCHA checkbox (it is inside an iframe and
-    ignores synthetic JS clicks)."""
     try:
         frames = driver.find_elements(
             By.CSS_SELECTOR, 'iframe[src*="recaptcha"], iframe[title*="reCAPTCHA"]')
@@ -1538,19 +1544,22 @@ def main() -> int:
         if driver is None:
             vpn_deadline = time.time() + VPN_BUDGET
             log(f"[*] tier 2: VPN Gate (budget {VPN_BUDGET}s, {VPN_TRY_TIMEOUT}s/attempt, "
-                f"root={IS_ROOT})")
+                f"max_sessions {VPN_MAX_SESSIONS})")
             pool = fetch_vpngate(vpn_countries)
-            for tries, server in enumerate(pick_vpn_candidates(pool, VPN_MAX_TRIES), 1):
+            low = sum(1 for s in pool if 0 < s["sessions"] <= VPN_MAX_SESSIONS)
+            log(f"[*] low-load servers (<= {VPN_MAX_SESSIONS} sessions): {low}")
+            candidates = pick_vpn_candidates(pool, VPN_MAX_TRIES)
+
+            for tries, server in enumerate(candidates, 1):
                 if budget_left(vpn_deadline) <= 0:
                     log("    [!] vpn budget exhausted")
                     break
                 attempt_deadline = min(time.time() + VPN_TRY_TIMEOUT, vpn_deadline)
-                log(f"    [*] vpn try {tries}/{VPN_MAX_TRIES}: {server['cc']} "
-                    f"{server['ip']} ping={server['ping']:.0f} "
-                    f"sessions={server['sessions']} score={server['score']:.0f}")
+                log(f"    [*] vpn try {tries}/{len(candidates)}: {server['cc']} "
+                    f"{server['ip']} ping={server['ping']:.0f} sessions={server['sessions']}")
                 vpn_proc = start_vpn(server)
                 if not wait_for_tunnel(vpn_proc, attempt_deadline):
-                    log(f"    [!] vpn {server['cc']} no tunnel: {vpn_tail()}")
+                    log(f"    [!] vpn {server['cc']} failed: {vpn_tail()}")
                     stop_vpn(vpn_proc)
                     vpn_proc = None
                     continue
