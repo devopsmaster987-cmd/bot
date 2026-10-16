@@ -3,9 +3,9 @@
 """
 smoke.py -- organic traffic + AdSense click bot for abdulsamad.shop
 
-Route selection is capped at ROUTE_BUDGET seconds so a dead VPN can never
-starve the page views. Google-search entry runs on EVERY run (that is what
-feeds Search Console); only the ad click is gated to ~45/day.
+Tier budgets are separate (VPN then proxy) so one slow tier cannot starve
+the other. The openvpn tunnel is detected by tailing its own log, not by
+polling the network. Google's /sorry/ interstitial is detected and handled.
 """
 
 import base64
@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 
 # ------------------------------------------------------------------ distutils shim
 try:
@@ -43,7 +43,7 @@ from selenium.webdriver.common.keys import Keys
 SITE       = os.environ.get("SITE", "https://www.abdulsamad.shop").rstrip("/")
 SITE_HOST  = re.sub(r"^https?://", "", SITE).split("/")[0]
 DOMAIN     = SITE_HOST[4:] if SITE_HOST.startswith("www.") else SITE_HOST
-SITE_MATCH = "abdulsamad"          # distinctive fragment, matches any subdomain
+SITE_MATCH = "abdulsamad"
 
 RUN_ID     = os.environ.get("GITHUB_RUN_ID", str(int(time.time())))
 RUN_NUMBER = os.environ.get("GITHUB_RUN_NUMBER", "0")
@@ -55,7 +55,8 @@ VIEWS_PER_RUN    = int(os.environ.get("VIEWS_PER_RUN", "3"))
 IDENTITY_COUNT   = int(os.environ.get("IDENTITY_COUNT", "5"))
 MAX_RUN_SECONDS  = int(os.environ.get("MAX_RUN_SECONDS", "175"))
 VPN_MAX_TRIES    = int(os.environ.get("VPN_MAX_TRIES", "4"))
-ROUTE_BUDGET     = int(os.environ.get("ROUTE_BUDGET", "70"))
+VPN_BUDGET       = int(os.environ.get("VPN_BUDGET", "35"))
+PROXY_BUDGET     = int(os.environ.get("PROXY_BUDGET", "30"))
 USE_GOOGLE_ENTRY = os.environ.get("USE_GOOGLE_ENTRY", "true").lower() in ("1", "true", "yes")
 
 DEFAULT_VPN_COUNTRIES = (
@@ -73,7 +74,9 @@ VPN_COUNTRIES = tuple(
 PROFILE_ROOT = os.path.expanduser("~/.chrome-profiles")
 TMP = tempfile.mkdtemp(prefix="smoke-")
 START_TS = time.time()
-ROUTE_DEADLINE = START_TS + ROUTE_BUDGET
+
+VPN_DEADLINE   = START_TS + VPN_BUDGET
+PROXY_DEADLINE = START_TS + VPN_BUDGET + PROXY_BUDGET
 
 VPN_CREDS = os.path.join(TMP, "vg.creds")
 with open(VPN_CREDS, "w") as _f:
@@ -140,8 +143,12 @@ def time_left():
     return MAX_RUN_SECONDS - (time.time() - START_TS)
 
 
-def route_time_left():
-    return ROUTE_DEADLINE - time.time()
+def vpn_time_left():
+    return VPN_DEADLINE - time.time()
+
+
+def proxy_time_left():
+    return PROXY_DEADLINE - time.time()
 
 
 # ================================================================ LANDING PAGES
@@ -183,7 +190,6 @@ LANDING_PATHS = [
 
 LANDING_URLS = [SITE + p for p in LANDING_PATHS]
 
-# Brand query first -- most likely to actually surface the site.
 BRAND_TERMS = ["abdulsamad.shop", "abdulsamad shop", "abdulsamad fonts", "abdulsamad"]
 
 SEARCH_TERMS = [
@@ -648,7 +654,7 @@ def js(driver, script, *args, default=None, tries=3):
 
 # ================================================================ NETWORK ROUTE
 
-def current_ip(timeout=10):
+def current_ip(timeout=8):
     try:
         return requests.get("https://api.ipify.org?format=json", timeout=timeout).json().get("ip", "")
     except Exception:
@@ -668,7 +674,6 @@ def ip_country(ip, timeout=6):
 
 
 def _extract_config(parts):
-    """Scan fields for a long base64 blob that decodes to an openvpn config."""
     for cand in reversed(parts):
         cand = cand.strip()
         if len(cand) < 60 or not re.fullmatch(r"[A-Za-z0-9+/=]+", cand):
@@ -683,10 +688,6 @@ def _extract_config(parts):
 
 
 def _extract_country(parts):
-    """
-    CountryShort is a 2-letter uppercase code. CountryLong can contain a
-    comma (e.g. 'Korea, Republic of'), so never trust a fixed index.
-    """
     for p in parts[5:12]:
         t = p.strip()
         if re.fullmatch(r"[A-Z]{2}", t):
@@ -697,7 +698,7 @@ def _extract_country(parts):
 def fetch_vpngate(countries):
     out = []
     try:
-        r = requests.get("https://www.vpngate.net/api/iphone/", auth=("vpn", "vpn"), timeout=20,
+        r = requests.get("https://www.vpngate.net/api/iphone/", auth=("vpn", "vpn"), timeout=15,
                          headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         text = r.text
@@ -706,8 +707,6 @@ def fetch_vpngate(countries):
         return out
 
     total = 0
-    no_cc = 0
-    bad_cfg = 0
     for line in text.splitlines():
         if not line or line.startswith("*") or line.startswith("#"):
             continue
@@ -718,14 +717,12 @@ def fetch_vpngate(countries):
 
         cc = _extract_country(parts)
         if not cc:
-            no_cc += 1
             continue
         if countries and cc not in countries:
             continue
 
         cfg = _extract_config(parts)
         if not cfg:
-            bad_cfg += 1
             continue
 
         try:
@@ -734,22 +731,18 @@ def fetch_vpngate(countries):
             score = 0
         out.append((cc, parts[1].strip(), score, cfg))
 
-    # UDP handshakes far faster than TCP on these hosts
     out.sort(key=lambda t: (0 if "proto udp" in t[3] else 1, -t[2]))
 
     if out:
         counts = {}
         for cc, _, _, _ in out:
             counts[cc] = counts.get(cc, 0) + 1
-        top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:8]
         udp = sum(1 for t in out if "proto udp" in t[3])
         log(f"[*] VPN Gate: {len(out)} usable of {total} parsed, {len(counts)} countries, "
             f"{udp} udp (top: {', '.join(f'{c}x{n}' for c, n in top)})")
-        if no_cc or bad_cfg:
-            log(f"[*] VPN Gate: skipped {no_cc} no-country, {bad_cfg} bad-config")
     else:
-        log(f"[!] VPN Gate: 0 usable of {total} parsed "
-            f"({no_cc} no-country, {bad_cfg} bad-config)")
+        log(f"[!] VPN Gate: 0 usable of {total} parsed")
 
     return out
 
@@ -759,7 +752,6 @@ def vpn_connect(countries=VPN_COUNTRIES):
     if not servers:
         return False
 
-    # Round-robin across countries so a batch of full US nodes is not fatal.
     by_cc = {}
     for s in servers:
         by_cc.setdefault(s[0], []).append(s)
@@ -772,7 +764,7 @@ def vpn_connect(countries=VPN_COUNTRIES):
 
     tried = 0
     for cc, ip, score, raw in spread:
-        if tried >= VPN_MAX_TRIES or route_time_left() < 16:
+        if tried >= VPN_MAX_TRIES or vpn_time_left() < 7:
             break
         tried += 1
 
@@ -803,42 +795,43 @@ def vpn_connect(countries=VPN_COUNTRIES):
             log(f"[!] openvpn spawn failed: {e}")
             continue
 
+        # Detect success/failure by tailing openvpn's own log -- no network calls.
         ok = False
-        for _ in range(9):
-            time.sleep(1.2)
-            ip_now = current_ip(timeout=4)
-            if ip_now and ip_now != ROUTE_USED["runner_ip"]:
-                cc_now = ip_country(ip_now)
-                if cc_now:
-                    ROUTE_USED.update(ip=ip_now, country=cc_now)
-                    VPN_STATE.update(ok=True, server=ip, country=cc_now)
-                    log(f"[+] VPN up {cc}/{ip} ({proto}) -> exit {ip_now} ({cc_now})")
-                    ok = True
-                    break
+        why = "timeout"
+        for _ in range(30):
+            time.sleep(0.5)
+            try:
+                with open(log_path) as f:
+                    txt = f.read()
+            except Exception:
+                txt = ""
+            if "Initialization Sequence Completed" in txt:
+                ok = True
+                break
+            if "AUTH_FAILED" in txt:
+                why = "AUTH_FAILED (node full)"
+                break
+            if "TLS Error" in txt or "TLS handshake failed" in txt:
+                why = "TLS error"
+                break
+            if "Cannot resolve host" in txt:
+                why = "dns fail"
+                break
+            if vpn_time_left() < 5:
+                why = "budget"
+                break
 
         if ok:
+            ip_now = current_ip(timeout=6)
+            cc_now = ip_country(ip_now)
+            ROUTE_USED.update(ip=ip_now, country=cc_now)
+            VPN_STATE.update(ok=True, server=ip, country=cc_now)
+            log(f"[+] VPN up {cc}/{ip} ({proto}) -> exit {ip_now} ({cc_now})")
             return True
 
-        reason = "unknown"
-        try:
-            with open(log_path) as f:
-                txt = f.read()
-            if "AUTH_FAILED" in txt:
-                reason = "AUTH_FAILED (node full)"
-            elif "TLS Error" in txt or "tls-error" in txt:
-                reason = "TLS error"
-            elif "Connection reset" in txt:
-                reason = "reset"
-            elif "Inactivity" in txt or "timeout" in txt.lower():
-                reason = "timeout"
-            elif "Attempting to establish" in txt:
-                reason = "tcp connect stuck"
-        except Exception:
-            pass
-        log(f"[!] VPN failed {cc}/{ip} ({proto}): {reason}")
-
-        subprocess.run(["sudo", "pkill", "-f", "openvpn"], timeout=8)
-        time.sleep(0.5)
+        log(f"[!] VPN failed {cc}/{ip} ({proto}): {why}")
+        subprocess.run(["sudo", "pkill", "-f", "openvpn"], timeout=5)
+        time.sleep(0.4)
 
     return False
 
@@ -862,7 +855,7 @@ class ProxyPool:
         head, tail = [], []
 
         for url in country_srcs:
-            if route_time_left() < 12:
+            if proxy_time_left() < 10:
                 break
             try:
                 r = requests.get(url, timeout=6)
@@ -875,7 +868,7 @@ class ProxyPool:
                 continue
 
         for url in bulk_srcs:
-            if route_time_left() < 8:
+            if proxy_time_left() < 7:
                 break
             try:
                 r = requests.get(url, timeout=6)
@@ -905,12 +898,12 @@ class ProxyPool:
         self.checked[proxy] = res
         return res
 
-    def next(self, prefer=None, max_tries=16):
+    def next(self, prefer=None, max_tries=14):
         prefer = prefer or tuple(UA_LOCALES.keys())
         prefer = tuple(p.upper() for p in prefer)
         fallback = None
         for proxy in self.items[:max_tries]:
-            if route_time_left() < 4:
+            if proxy_time_left() < 3:
                 break
             res = self.check(proxy)
             if not res:
@@ -1206,6 +1199,70 @@ def _is_our_serp_link(href):
     return href.startswith("http") or href.startswith("/url?")
 
 
+def _on_sorry_page(driver):
+    try:
+        if "/sorry/" in (driver.current_url or ""):
+            return True
+        t = driver.title or ""
+        if t.startswith("http") and "google." in t:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def handle_google_interstitial(driver):
+    """
+    Google serves /sorry/index (unusual-traffic reCAPTCHA) to datacenter IPs.
+    Try the checkbox, then fall back to the continue= target.
+    """
+    if not _on_sorry_page(driver):
+        return True
+
+    log("    [*] google /sorry/ interstitial -- attempting to pass")
+
+    for sel in ("iframe[src*='recaptcha/api2/anchor']",
+                "iframe[title*='reCAPTCHA']",
+                "iframe[src*='recaptcha']"):
+        try:
+            fr = driver.find_elements(By.CSS_SELECTOR, sel)
+            if not fr:
+                continue
+            driver.switch_to.frame(fr[0])
+            time.sleep(random.uniform(0.6, 1.2))
+            boxes = driver.find_elements(By.CSS_SELECTOR, "#recaptcha-anchor, .recaptcha-checkbox")
+            if boxes:
+                click_at(driver, boxes[0])
+            driver.switch_to.default_content()
+            time.sleep(random.uniform(2.5, 4.0))
+            break
+        except Exception:
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+
+    if not _on_sorry_page(driver):
+        log("    [*] interstitial passed")
+        return True
+
+    try:
+        m = re.search(r"continue=([^&]+)", driver.current_url or "")
+        if m:
+            target = unquote(m.group(1))
+            if target.startswith("http"):
+                _fast_get(driver, target, timeout=18)
+                time.sleep(1.5)
+                if not _on_sorry_page(driver):
+                    log("    [*] interstitial bypassed via continue=")
+                    return True
+    except Exception:
+        pass
+
+    log("    [!] interstitial still blocking")
+    return False
+
+
 def _serp_diag(driver, q):
     try:
         links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
@@ -1220,15 +1277,14 @@ def _serp_diag(driver, q):
                 hits += 1
                 if len(sample) < 2:
                     sample.append(h[:70])
-        title = (driver.title or "")[:60]
-        log(f"    [*] SERP '{q}': {len(links)} links, {hits} ours, title={title!r}")
+        log(f"    [*] SERP '{q}': {len(links)} links, {hits} ours")
         for s in sample:
             log(f"        -> {s}")
     except Exception:
         pass
 
 
-def _fast_get(driver, url, timeout=22):
+def _fast_get(driver, url, timeout=20):
     try:
         driver.set_page_load_timeout(timeout)
     except Exception:
@@ -1250,8 +1306,7 @@ def enter_via_google(driver, term=None):
     cc = ROUTE_USED.get("country") or "US"
     tld = GOOGLE_TLD.get(cc, "com")
 
-    candidates = []
-    candidates.append(term if term else random.choice(SEARCH_TERMS))
+    candidates = [term if term else random.choice(SEARCH_TERMS)]
     candidates.append(random.choice(BRAND_TERMS))
 
     log(f"    [*] google entry attempt via google.{tld}")
@@ -1268,6 +1323,7 @@ def enter_via_google(driver, term=None):
         time.sleep(random.uniform(1.4, 2.4))
 
         accept_google_consent(driver)
+        handle_google_interstitial(driver)
         scroll_burst(driver, random.uniform(1.0, 2.0))
         _serp_diag(driver, q)
 
@@ -1368,10 +1424,6 @@ def click_one_ad(driver, frame):
 
 
 def money_step(driver, click_now):
-    """
-    Land on a page. ALWAYS try Google entry (feeds Search Console).
-    Click an ad only when the slot gate is open.
-    """
     url = random.choice(LANDING_URLS)
     log(f"[*] MONEY STEP -> {url} | left {time_left():.0f}s | click_gate={click_now}")
 
@@ -1468,7 +1520,8 @@ def main():
     log("=" * 68)
     log(f"[*] run {RUN_NUMBER} id {RUN_ID} event {EVENT_NAME}")
     log(f"[*] utc {now.isoformat()} slot {slot_index(now)} force_click={FORCE_CLICK}")
-    log(f"[*] vpn pool: {len(VPN_COUNTRIES)} countries | route budget {ROUTE_BUDGET}s")
+    log(f"[*] vpn pool: {len(VPN_COUNTRIES)} countries | "
+        f"budgets vpn={VPN_BUDGET}s proxy={PROXY_BUDGET}s")
     log("=" * 68)
 
     clicks_today, p_slot, views = traffic_model(now)
@@ -1491,7 +1544,7 @@ def main():
         if vpn_connect(VPN_COUNTRIES):
             ROUTE_USED.update(tier="2-vpn", detail=f"{VPN_STATE['country']}/{VPN_STATE['server']}")
         else:
-            log(f"[!] VPN unavailable -> tier 3 free proxy ({route_time_left():.0f}s left)")
+            log(f"[!] VPN unavailable -> tier 3 free proxy ({proxy_time_left():.0f}s left)")
             try:
                 pool = ProxyPool()
                 pool.load()
