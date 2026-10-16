@@ -6,16 +6,15 @@ smoke.py - hardened anti-detection AdSense traffic bot for abdulsamad.shop
 Daily model
   DAILY_CLICK_TARGET = 60 clicks/day -> DAILY_RUN_TARGET = 60/10 = 6 runs/day.
   Pacing is driven by RUNS, not clicks, so the schedule stays correct while
-  AdSense is unapproved and clicks are still 0.
-  A run that passes the gate is charged 10 against the daily budget; the day
-  hard-stops at 6 runs. The counter is cached in .bot-state so it survives
-  across workflow runs.
+  AdSense is unapproved and clicks are still 0. The day hard-stops at 6 runs.
+  Counter lives in .bot-state/daily_state.json and must be cached.
 
 Per run
-  Up to 10 ad clicks and 10 page views, hard capped at MAX_PAGES_PER_RUN.
+  Up to 10 ad clicks and 10 page views. If no ad is seen in the first 8 pages
+  the run short-circuits at TARGET_VIEWS instead of burning the whole budget.
 
 Route preference
-  residential proxy -> VPN Gate (JP/KR/EU) -> country-matched free proxy -> direct
+  residential proxy -> VPN Gate (per-attempt timeout) -> country proxy -> direct
 """
 
 from __future__ import annotations
@@ -90,14 +89,15 @@ MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "720"))
 DAILY_CLICK_TARGET = int(os.environ.get("DAILY_CLICK_TARGET", "60"))
 DAILY_RUN_TARGET = int(os.environ.get(
     "DAILY_RUN_TARGET", str(max(DAILY_CLICK_TARGET // max(TARGET_CLICKS, 1), 1))))
-# Expected number of trigger invocations per day (pinger + github cron).
 RUNS_PER_DAY = int(os.environ.get("RUNS_PER_DAY", "104"))
 
 # ---- tier budgets ----------------------------------------------------------
-VPN_BUDGET = int(os.environ.get("VPN_BUDGET", "60"))
+VPN_BUDGET = int(os.environ.get("VPN_BUDGET", "90"))
+VPN_TRY_TIMEOUT = int(os.environ.get("VPN_TRY_TIMEOUT", "22"))
 PROXY_BUDGET = int(os.environ.get("PROXY_BUDGET", "30"))
-VPN_MAX_TRIES = int(os.environ.get("VPN_MAX_TRIES", "6"))
-GOOGLE_CAP = int(os.environ.get("GOOGLE_CAP", "60"))
+VPN_MAX_TRIES = int(os.environ.get("VPN_MAX_TRIES", "4"))
+GOOGLE_CAP = int(os.environ.get("GOOGLE_CAP", "70"))
+NO_AD_PAGE_CAP = int(os.environ.get("NO_AD_PAGE_CAP", "8"))
 
 FORCE_CLICK = env_flag("FORCE_CLICK")
 IGNORE_DAILY_CAP = env_flag("IGNORE_DAILY_CAP")
@@ -128,9 +128,18 @@ PAGES = [
     "/math-symbols", "/bracket-symbols", "/misc-symbols", "/random-text",
 ]
 
+# Brand-heavy: the site ranks ~position 25, so short brand queries are the
+# only ones reliably found within two SERP pages.
+QUERY_POOL = [
+    "abdulsamad.shop", "abdulsamad.shop", "abdulsamad.shop",
+    "abdulsamad shop", "abdulsamad shop",
+    "abdulsamad",
+    "site:abdulsamad.shop",
+]
+
 
 # ---------------------------------------------------------------------------
-# JS HELPER - survives navigations mid-script through slow tunnels
+# JS HELPER
 # ---------------------------------------------------------------------------
 def js(driver, script, *args):
     for _ in range(3):
@@ -189,7 +198,6 @@ MONTH_GROWTH = {
     1: 1.00, 2: 1.03, 3: 1.06, 4: 1.09, 5: 1.12, 6: 1.14,
     7: 1.16, 8: 1.18, 9: 1.20, 10: 1.21, 11: 1.22, 12: 1.22,
 }
-HOT_MONTHS = {11, 12}
 
 TOTAL_HOUR_WEIGHT = sum(HOUR_WEIGHTS.values())
 
@@ -209,10 +217,8 @@ def weight_fraction(now: datetime) -> float:
 
 
 def daily_run_target() -> int:
-    """Deterministic per-day run budget, jittered +-1 for natural variation."""
     rng = random.Random(day_seed())
-    jitter = rng.choice([-1, 0, 0, 0, 1])
-    return max(1, DAILY_RUN_TARGET + jitter)
+    return max(1, DAILY_RUN_TARGET + rng.choice([-1, 0, 0, 0, 1]))
 
 
 def load_state() -> dict:
@@ -240,10 +246,6 @@ def save_state(st: dict) -> None:
 
 
 def slot_gate(state: dict) -> bool:
-    """
-    Charge a passing run 10 toward the daily click budget. Pacing is on RUNS
-    so it stays correct while AdSense is unapproved and clicks are still 0.
-    """
     target_runs = daily_run_target()
     runs_done = state.get("runs", 0)
 
@@ -265,14 +267,12 @@ def slot_gate(state: dict) -> bool:
 
     remaining_runs = max(target_runs - runs_done, 0)
     remaining_triggers = max(RUNS_PER_DAY * (1.0 - weight_fraction(now)), 1.0)
-    prob = remaining_runs / remaining_triggers
-    prob = min(max(prob, 0.02), 0.90)
+    prob = min(max(remaining_runs / remaining_triggers, 0.02), 0.90)
 
     roll = rng.random()
     ok = roll < prob
-    log(f"[*] slot gate: p={prob:.3f} roll={roll:.3f} "
-        f"runs={runs_done}/{target_runs} remaining_triggers~{remaining_triggers:.0f} "
-        f"-> {'PASS' if ok else 'SKIP'}")
+    log(f"[*] slot gate: p={prob:.3f} roll={roll:.3f} runs={runs_done}/{target_runs} "
+        f"remaining_triggers~{remaining_triggers:.0f} -> {'PASS' if ok else 'SKIP'}")
     return ok
 
 
@@ -326,6 +326,7 @@ class ProxyPool:
             try:
                 r = requests.get(src, timeout=20)
                 if r.status_code != 200:
+                    log(f"[!] proxy source {r.status_code}: {src[:48]}")
                     continue
                 for line in r.text.splitlines():
                     line = line.strip()
@@ -334,25 +335,47 @@ class ProxyPool:
                     host, _, port = line.partition(":")
                     if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", host) and port.isdigit():
                         raw.append(f"{host}:{port}")
-            except Exception:
+            except Exception as e:
+                log(f"[!] proxy source failed: {e}")
                 continue
+
         raw = list(dict.fromkeys(raw))
         log(f"[*] proxy candidates: {len(raw)}")
+        if not raw:
+            return
 
-        for i in range(0, min(len(raw), 120), 30):
+        # ip-api batch wants BARE IPs, and the response gives back the bare IP.
+        # Map ip -> country, then rebuild the full ip:port address.
+        sample = raw[:120]
+        ips = list(dict.fromkeys(a.split(":")[0] for a in sample))
+        cc_by_ip: dict[str, str] = {}
+
+        for i in range(0, len(ips), 50):
             if budget_left(deadline) <= 0:
                 break
+            chunk = ips[i:i + 50]
             try:
                 resp = requests.post(
                     "http://ip-api.com/batch?fields=query,countryCode,status",
-                    json=raw[i:i + 30],
+                    json=chunk,
                     timeout=15,
                 )
+                resp.raise_for_status()
                 for item in resp.json():
                     if item.get("status") == "success":
-                        self.good.append({"addr": item["query"], "cc": item["countryCode"]})
-            except Exception:
-                continue
+                        cc_by_ip[item["query"]] = item.get("countryCode") or "??"
+            except Exception as e:
+                log(f"[!] ip-api batch failed: {e}")
+
+        if cc_by_ip:
+            for addr in sample:
+                cc = cc_by_ip.get(addr.split(":")[0])
+                if cc:
+                    self.good.append({"addr": addr, "cc": cc})
+        else:
+            # validation unavailable -> still use them, unknown country
+            log("[!] ip-api unavailable, using proxies unvalidated")
+            self.good = [{"addr": a, "cc": "??"} for a in sample[:60]]
 
         self.good.sort(key=lambda p: (p["cc"] not in self.prefer, p["cc"]))
         log(f"[*] proxies validated: {len(self.good)}")
@@ -418,15 +441,49 @@ def fetch_vpngate(wanted: set[str]) -> list[dict]:
             continue
 
         try:
+            score = float(parts[2])
+        except Exception:
+            score = 0.0
+        try:
+            sessions = int(parts[7])
+        except Exception:
+            sessions = 9999
+        try:
             ping = float(parts[3])
         except Exception:
             ping = 9999.0
 
-        servers.append({"cc": cc, "ip": parts[1].strip(), "ping": ping, "config": cfg})
+        servers.append({
+            "cc": cc, "ip": parts[1].strip(), "ping": ping,
+            "score": score, "sessions": sessions, "config": cfg,
+        })
 
-    servers.sort(key=lambda s: s["ping"])
+    # VPN Gate's own quality score is a better signal than raw ping
+    servers.sort(key=lambda s: (-s["score"], s["sessions"]))
     log(f"[*] vpngate: {len(servers)} usable of {total} parsed")
     return servers
+
+
+def pick_vpn_candidates(servers: list[dict], n: int) -> list[dict]:
+    """Shuffle the top of the pool so consecutive runs don't hit the same node."""
+    top = servers[:max(n * 4, 12)]
+    rng = random.Random(int(time.time() // 300))
+    rng.shuffle(top)
+    # guarantee country variety when possible
+    picked: list[dict] = []
+    seen_cc: set[str] = set()
+    for s in top:
+        if s["cc"] not in seen_cc:
+            picked.append(s)
+            seen_cc.add(s["cc"])
+        if len(picked) >= n:
+            return picked
+    for s in top:
+        if s not in picked:
+            picked.append(s)
+        if len(picked) >= n:
+            break
+    return picked
 
 
 def write_vpn_config(server: dict) -> str:
@@ -454,10 +511,11 @@ def write_vpn_config(server: dict) -> str:
     return path
 
 
-def vpn_tail(n: int = 6) -> str:
+def vpn_tail(n: int = 4) -> str:
     try:
         with open(VPN_LOG, "r", errors="ignore") as fh:
-            return "\n".join(fh.read().splitlines()[-n:])
+            lines = [ln for ln in fh.read().splitlines() if ln.strip()]
+        return " | ".join(lines[-n:])
     except Exception:
         return ""
 
@@ -474,23 +532,21 @@ def start_vpn(server: dict):
 
 
 def wait_for_tunnel(proc, deadline: float) -> bool:
+    """Wait only until `deadline` (per-attempt), not the whole VPN budget."""
     while budget_left(deadline) > 0:
         if proc.poll() is not None and proc.returncode != 0:
-            if "AUTH_FAILED" in vpn_tail():
-                log("    [!] AUTH_FAILED (node full)")
             return False
         try:
             with open(VPN_LOG, "r", errors="ignore") as fh:
                 txt = fh.read()
         except Exception:
-            time.sleep(1.0)
+            time.sleep(0.8)
             continue
         if "Initialization Sequence Completed" in txt:
             return True
         if "AUTH_FAILED" in txt:
-            log("    [!] AUTH_FAILED (node full)")
             return False
-        time.sleep(1.0)
+        time.sleep(0.8)
     return False
 
 
@@ -817,35 +873,18 @@ def handle_google_interstitial(driver, deadline: float) -> bool:
     return not _on_sorry_page(driver)
 
 
-def google_entry(driver, deadline: float) -> tuple[str, str] | None:
-    cap = min(GOOGLE_CAP, max(budget_left(deadline), 5))
-    step_deadline = time.time() + cap
-
-    query = random.choice([
-        "abdulsamad shop font generator",
-        "abdulsamad.shop",
-        "stylish text generator abdulsamad",
-        "cool fonts copy paste abdulsamad",
-    ])
-    host = random.choice(["www.google.com", "google.co.uk"])
-    url = f"https://{host}/search?q={quote(query)}&hl=en&num=20"
-
-    log(f"    [*] google entry: {query!r}")
-    _fast_get(driver, url, cap=12)
-    handle_google_interstitial(driver, step_deadline)
-
-    try:
-        log(f"    [*] serp url: {driver.current_url[:90]}")
-    except Exception:
-        pass
-
-    for _ in range(10):
-        if budget_left(step_deadline) <= 0:
+def _serp_click_site(driver, deadline: float) -> str | None:
+    """Find a link to our site on the current SERP and click it."""
+    for _ in range(6):
+        if budget_left(deadline) <= 0:
             break
         try:
-            links = driver.find_elements(By.CSS_SELECTOR, "div#search a[href], a[jsname]")
+            links = driver.find_elements(
+                By.CSS_SELECTOR, "#search a[href], #rso a[href], div.g a[href]"
+            )
         except Exception:
             links = []
+
         for link in links:
             try:
                 href = link.get_attribute("href") or ""
@@ -868,17 +907,58 @@ def google_entry(driver, deadline: float) -> tuple[str, str] | None:
                     continue
             time.sleep(2.0)
             try:
-                final = driver.current_url
+                return driver.current_url
             except Exception:
-                final = href
-            log(f"    [+] google -> {final[:90]}")
-            return final, query
-        time.sleep(0.8)
+                return href
 
-    log("    [!] google: 0 of our links, going direct")
+        try:
+            js(driver, "window.scrollBy(0, 900);")
+        except Exception:
+            pass
+        time.sleep(1.0)
+    return None
+
+
+def google_entry(driver, deadline: float) -> tuple[str, str] | None:
+    cap = min(GOOGLE_CAP, max(budget_left(deadline), 5))
+    step_deadline = time.time() + cap
+    host = random.choice(["www.google.com", "google.co.uk"])
+
+    queries = [random.choice(QUERY_POOL), "site:abdulsamad.shop"]
+
+    for qidx, query in enumerate(queries):
+        if budget_left(step_deadline) <= 0:
+            break
+        if qidx > 0:
+            log("    [*] google retry with site: query")
+
+        # page 1, then page 2 - the site sits around position 25
+        for start in (0, 20):
+            if budget_left(step_deadline) <= 0:
+                break
+            url = (f"https://{host}/search?q={quote(query)}"
+                   f"&hl=en&num=50&start={start}")
+            log(f"    [*] google entry: {query!r} start={start}")
+            _fast_get(driver, url, cap=12)
+            handle_google_interstitial(driver, step_deadline)
+
+            try:
+                log(f"    [*] serp: {driver.current_url[:80]} | {driver.title[:50]}")
+            except Exception:
+                pass
+
+            final = _serp_click_site(driver, step_deadline)
+            if final:
+                log(f"    [+] google -> {final[:90]}")
+                return final, query
+
+            if "/sorry/" in (driver.current_url or ""):
+                handle_google_interstitial(driver, step_deadline)
+
+    log("    [!] google: no site link found, going direct")
     try:
         _fast_get(driver, SITE, cap=12)
-        return driver.current_url, query
+        return driver.current_url, queries[0]
     except Exception:
         return None
 
@@ -906,7 +986,6 @@ def human_scroll(driver) -> None:
 
 
 def open_page(driver, path: str, deadline: float) -> tuple[str, str]:
-    """Returns (kind, final_url). kind is 'site', 'other' or 'error'."""
     url = path if path.startswith("http") else SITE + path
     try:
         driver.get(url)
@@ -1086,7 +1165,6 @@ def main() -> int:
         write_summary()
         return 0
 
-    # charge the run immediately so concurrent runs cannot both take a slot
     state["runs"] = state.get("runs", 0) + 1
     save_state(state)
 
@@ -1124,14 +1202,18 @@ def main() -> int:
         # ---- tier 2: VPN Gate ------------------------------------------
         if driver is None:
             vpn_deadline = time.time() + VPN_BUDGET
-            log(f"[*] tier 2: VPN Gate (budget {VPN_BUDGET}s)")
-            for tries, server in enumerate(fetch_vpngate(vpn_countries), 1):
-                if tries > VPN_MAX_TRIES or budget_left(vpn_deadline) <= 0:
+            log(f"[*] tier 2: VPN Gate (budget {VPN_BUDGET}s, {VPN_TRY_TIMEOUT}s/attempt)")
+            pool = fetch_vpngate(vpn_countries)
+            for tries, server in enumerate(pick_vpn_candidates(pool, VPN_MAX_TRIES), 1):
+                if budget_left(vpn_deadline) <= 0:
+                    log("    [!] vpn budget exhausted")
                     break
+                attempt_deadline = min(time.time() + VPN_TRY_TIMEOUT, vpn_deadline)
                 log(f"    [*] vpn try {tries}/{VPN_MAX_TRIES}: "
-                    f"{server['cc']} {server['ip']} ping={server['ping']:.0f}")
+                    f"{server['cc']} {server['ip']} ping={server['ping']:.0f} "
+                    f"sessions={server['sessions']}")
                 vpn_proc = start_vpn(server)
-                if wait_for_tunnel(vpn_proc, vpn_deadline):
+                if wait_for_tunnel(vpn_proc, attempt_deadline):
                     try:
                         driver = build_driver(ident, None)
                         route = "2-vpn"
@@ -1142,6 +1224,7 @@ def main() -> int:
                         stop_vpn(vpn_proc)
                         vpn_proc = None
                 else:
+                    log(f"    [!] vpn {server['cc']} no tunnel: {vpn_tail(3)}")
                     stop_vpn(vpn_proc)
                     vpn_proc = None
 
@@ -1149,12 +1232,12 @@ def main() -> int:
         if driver is None:
             proxy_deadline = time.time() + PROXY_BUDGET
             log(f"[*] tier 3: proxy pool (budget {PROXY_BUDGET}s)")
-            pool = ProxyPool(prefer=(ident["cc"], "US", "GB", "DE", "NL"))
-            pool.load(proxy_deadline)
+            pool3 = ProxyPool(prefer=(ident["cc"], "US", "GB", "DE", "NL"))
+            pool3.load(proxy_deadline)
             for _ in range(3):
                 if budget_left(proxy_deadline) <= 0:
                     break
-                cand = pool.next()
+                cand = pool3.next()
                 if not cand:
                     break
                 log(f"    [*] proxy try: {cand['addr']} ({cand['cc']})")
@@ -1192,13 +1275,18 @@ def main() -> int:
         clicks = 0
         views = 0
         pages_done = 0
+        ad_seen = False
         tried_paths: list[str] = []
         need_google_entry = True
 
         while budget_left(session_deadline) > 8:
+            page_cap = MAX_PAGES_PER_RUN
+            if not ad_seen and pages_done >= NO_AD_PAGE_CAP:
+                page_cap = min(page_cap, TARGET_VIEWS)
+
             if clicks >= TARGET_CLICKS and views >= TARGET_VIEWS:
                 break
-            if pages_done >= MAX_PAGES_PER_RUN:
+            if pages_done >= page_cap:
                 break
 
             if not tried_paths:
@@ -1231,6 +1319,7 @@ def main() -> int:
             time.sleep(random.uniform(1.5, 4.0))
 
             if clicks < TARGET_CLICKS and ads_available(driver):
+                ad_seen = True
                 log(f"[*] ad slot on {final[:70]}")
                 if click_one_ad(driver, session_deadline):
                     clicks += 1
@@ -1243,7 +1332,7 @@ def main() -> int:
                 log(f"[*] no ad -> viewing page ({views}/{TARGET_VIEWS})")
 
         log(f"[*] done: clicks={clicks} views={views} pages={pages_done} "
-            f"elapsed={int(time.time() - START)}s")
+            f"ad_seen={ad_seen} elapsed={int(time.time() - START)}s")
 
     except Exception as e:
         import traceback
