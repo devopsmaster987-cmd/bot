@@ -3,12 +3,15 @@
 """
 smoke.py - anti-detection AdSense traffic bot for abdulsamad.shop
 
-openvpn is launched WITHOUT nested sudo when we are already root, and its
-stdout/stderr are redirected straight into the log so a silent start is
-impossible to miss.
+Runs as the normal user (no root). openvpn is elevated with `sudo -n`, which
+fails fast instead of hanging on a password prompt.
 
-The /sorry/ reCAPTCHA is clicked with real CDP mouse events (not .click()),
-because reCAPTCHA ignores synthetic JS clicks.
+VPN nodes are ranked by session count first, ping second - a full node returns
+AUTH_FAILED regardless of how attractive its ping looks.
+
+Phases
+  1. IMPRESSIONS via Google (skipped if google_health_check fails)
+  2. VIEWS/CLICKS via direct navigation (always runs)
 """
 
 from __future__ import annotations
@@ -177,7 +180,7 @@ def build_query_pool(pages: list[str]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# JS HELPER
+# JS / MOUSE HELPERS
 # ---------------------------------------------------------------------------
 def js(driver, script, *args):
     for _ in range(3):
@@ -504,15 +507,24 @@ def fetch_vpngate(wanted: set[str]) -> list[dict]:
         servers.append({"cc": cc, "ip": parts[1].strip(), "ping": ping,
                         "score": score, "sessions": sessions, "config": cfg})
 
-    servers.sort(key=lambda s: (-s["score"], s["sessions"]))
+    servers.sort(key=vpn_quality_key)
     log(f"[*] vpngate: {len(servers)} usable of {total} parsed")
     return servers
 
 
+def vpn_quality_key(s: dict) -> float:
+    """Lower is better. Session count dominates: a full node returns AUTH_FAILED
+    however attractive its ping looks."""
+    sess = s["sessions"] if s["sessions"] > 0 else 6   # 0 usually means stale
+    return (sess * 1.0) + (s["ping"] * 0.5) - (s["score"] * 0.003)
+
+
 def pick_vpn_candidates(servers: list[dict], n: int) -> list[dict]:
-    top = servers[:max(n * 4, 12)]
+    ordered = sorted(servers, key=vpn_quality_key)
+    top = ordered[:max(n * 3, 10)]
     rng = random.Random(int(time.time() // 300))
     rng.shuffle(top)
+
     picked, seen_cc = [], set()
     for s in top:
         if s["cc"] not in seen_cc:
@@ -537,8 +549,14 @@ def write_vpn_config(server: dict) -> str:
         if not s or s.startswith("auth-user-pass") or s.startswith("verb"):
             continue
         lines.append(s)
-    lines += [f"auth-user-pass {CREDS_PATH}", "allow-compression yes",
-              "connect-retry-max 1", "verb 3", "nobind"]
+    lines += [
+        f"auth-user-pass {CREDS_PATH}",
+        "allow-compression yes",
+        "data-ciphers-fallback AES-128-CBC",
+        "connect-retry-max 1",
+        "verb 3",
+        "nobind",
+    ]
     path = os.path.join(VPN_DIR, f"vpngate-{server['cc']}-{server['ip'].replace('.', '_')}.ovpn")
     with open(path, "w") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -555,7 +573,10 @@ def vpn_tail(n: int = 5) -> str:
     try:
         with open(VPN_LOG, "r", errors="ignore") as fh:
             lines = [ln for ln in fh.read().splitlines() if ln.strip()]
-        return " | ".join(lines[-n:])[:400]
+        # drop the noisy compression warnings so the real error is visible
+        useful = [ln for ln in lines if "Compression" not in ln and "compression" not in ln]
+        src = useful or lines
+        return " | ".join(src[-n:])[:400]
     except Exception as e:
         return f"<unreadable: {e}>"
 
@@ -565,15 +586,15 @@ def start_vpn(server: dict):
     if os.path.exists(VPN_LOG):
         os.remove(VPN_LOG)
 
-    # we are already root inside the workflow (sudo -E python) - no nested sudo
     cmd = [OPENVPN_BIN, "--config", cfg]
     if not IS_ROOT:
         cmd = ["sudo", "-n"] + cmd
 
     logfh = open(VPN_LOG, "ab", buffering=0)
-    proc = subprocess.Popen(cmd, stdout=logfh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    proc = subprocess.Popen(cmd, stdout=logfh, stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL)
     proc._logfh = logfh
-    log(f"      cmd: {' '.join(cmd)} (root={IS_ROOT})")
+    log(f"      cmd: {' '.join(cmd)}")
     return proc
 
 
@@ -584,16 +605,15 @@ FATAL_MARKERS = (
     "Cannot open TUN",
     "Cannot ioctl TUNSETIFF",
     "Permission denied",
-    "SIGTERM",
+    "ERROR: Cannot open TUN/TAP",
 )
 
 
 def wait_for_tunnel(proc, deadline: float) -> bool:
-    first_bytes_logged = False
+    saw_output = False
     while budget_left(deadline) > 0:
-        if proc.poll() is not None:
-            if proc.returncode != 0:
-                return False
+        if proc.poll() is not None and proc.returncode != 0:
+            return False
 
         try:
             with open(VPN_LOG, "r", errors="ignore") as fh:
@@ -602,8 +622,8 @@ def wait_for_tunnel(proc, deadline: float) -> bool:
             time.sleep(0.7)
             continue
 
-        if txt and not first_bytes_logged:
-            first_bytes_logged = True
+        if txt and not saw_output:
+            saw_output = True
             log(f"      openvpn started writing ({len(txt)}B)")
 
         if "Initialization Sequence Completed" in txt:
@@ -960,11 +980,8 @@ def handle_google_consent(driver, deadline: float) -> bool:
 
 
 def _click_recaptcha(driver) -> bool:
-    """Click the reCAPTCHA checkbox with REAL mouse events.
-
-    The checkbox lives inside an iframe, and reCAPTCHA ignores synthetic
-    JS clicks - both must be handled.
-    """
+    """Real mouse click on the reCAPTCHA checkbox (it is inside an iframe and
+    ignores synthetic JS clicks)."""
     try:
         frames = driver.find_elements(
             By.CSS_SELECTOR, 'iframe[src*="recaptcha"], iframe[title*="reCAPTCHA"]')
@@ -973,7 +990,7 @@ def _click_recaptcha(driver) -> bool:
 
     for f in frames:
         try:
-            frect = f.rect              # top-level viewport coords
+            frect = f.rect
         except Exception:
             continue
         try:
@@ -1011,9 +1028,9 @@ def _click_recaptcha(driver) -> bool:
 
 
 def _click_verify(driver) -> bool:
-    """If a challenge grid opened, hit the verify button (frame-aware)."""
     try:
-        frames = driver.find_elements(By.CSS_SELECTOR, 'iframe[src*="bframe"], iframe[title*="challenge"]')
+        frames = driver.find_elements(By.CSS_SELECTOR,
+                                      'iframe[src*="bframe"], iframe[title*="challenge"]')
     except Exception:
         frames = []
     for f in frames:
@@ -1056,7 +1073,6 @@ def _sorry_continue_target(driver) -> str | None:
 
 
 def solve_sorry(driver, deadline: float) -> bool:
-    """Solve Google's /sorry/ abuse wall."""
     if "/sorry/" not in _url(driver):
         return True
 
@@ -1070,7 +1086,6 @@ def solve_sorry(driver, deadline: float) -> bool:
         if _click_recaptcha(driver):
             log(f"      captcha clicked (attempt {attempt + 1})")
 
-        # poll for the wall to clear
         end = min(time.time() + 9, deadline)
         while time.time() < end:
             if "/sorry/" not in _url(driver):
@@ -1084,7 +1099,6 @@ def solve_sorry(driver, deadline: float) -> bool:
             log("    [+] /sorry/ cleared after verify")
             return True
 
-        # early bypass: jump straight at the continue target
         if attempt >= 1 and target:
             _fast_get(driver, target, cap=8)
             if "/sorry/" not in _url(driver):
@@ -1095,7 +1109,6 @@ def solve_sorry(driver, deadline: float) -> bool:
 
 
 def google_health_check(driver, deadline: float) -> bool:
-    """Prove Google works from this route before spending the run on it."""
     hc_deadline = min(deadline, time.time() + GOOGLE_HEALTH_SECONDS)
     log(f"[*] google health check (budget {GOOGLE_HEALTH_SECONDS}s)")
 
@@ -1232,8 +1245,7 @@ def impression_pass(driver, deadline: float, force_click: bool = False) -> dict:
     result["query"] = query
     host = random.choice(GOOGLE_HOSTS)
 
-    url = (f"https://{host}/search?q={quote(query)}"
-           f"&hl=en&gl=us&num=20&pws=0")
+    url = f"https://{host}/search?q={quote(query)}&hl=en&gl=us&num=20&pws=0"
 
     _fast_get(driver, url, cap=8)
 
@@ -1526,7 +1538,7 @@ def main() -> int:
         if driver is None:
             vpn_deadline = time.time() + VPN_BUDGET
             log(f"[*] tier 2: VPN Gate (budget {VPN_BUDGET}s, {VPN_TRY_TIMEOUT}s/attempt, "
-                f"root={IS_ROOT}, bin={OPENVPN_BIN})")
+                f"root={IS_ROOT})")
             pool = fetch_vpngate(vpn_countries)
             for tries, server in enumerate(pick_vpn_candidates(pool, VPN_MAX_TRIES), 1):
                 if budget_left(vpn_deadline) <= 0:
@@ -1534,7 +1546,8 @@ def main() -> int:
                     break
                 attempt_deadline = min(time.time() + VPN_TRY_TIMEOUT, vpn_deadline)
                 log(f"    [*] vpn try {tries}/{VPN_MAX_TRIES}: {server['cc']} "
-                    f"{server['ip']} ping={server['ping']:.0f} sessions={server['sessions']}")
+                    f"{server['ip']} ping={server['ping']:.0f} "
+                    f"sessions={server['sessions']} score={server['score']:.0f}")
                 vpn_proc = start_vpn(server)
                 if not wait_for_tunnel(vpn_proc, attempt_deadline):
                     log(f"    [!] vpn {server['cc']} no tunnel: {vpn_tail()}")
