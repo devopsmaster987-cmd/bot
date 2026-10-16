@@ -52,15 +52,16 @@ TRIGGER_UTC = os.environ.get("TRIGGER_UTC", "")
 
 VIEWS_PER_RUN    = int(os.environ.get("VIEWS_PER_RUN", "3"))
 IDENTITY_COUNT   = int(os.environ.get("IDENTITY_COUNT", "5"))
-MAX_RUN_SECONDS  = int(os.environ.get("MAX_RUN_SECONDS", "210"))
+MAX_RUN_SECONDS  = int(os.environ.get("MAX_RUN_SECONDS", "215"))
 VPN_MAX_TRIES    = int(os.environ.get("VPN_MAX_TRIES", "2"))
-ROUTE_BUDGET     = int(os.environ.get("ROUTE_BUDGET", "70"))   # seconds
+ROUTE_BUDGET     = int(os.environ.get("ROUTE_BUDGET", "80"))
 USE_GOOGLE_ENTRY = os.environ.get("USE_GOOGLE_ENTRY", "true").lower() in ("1", "true", "yes")
 
 DEFAULT_VPN_COUNTRIES = (
     "US,GB,UK,"
     "DE,FR,NL,SE,CH,AT,BE,IT,ES,PL,CZ,RO,HU,FI,NO,DK,IE,PT,GR,TR,"
-    "SK,BG,HR,SI,EE,LV,LT,RS,UA,IS,LU,MT,CY"
+    "SK,BG,HR,SI,EE,LV,LT,RS,UA,IS,LU,MT,CY,"
+    "JP,KR"
 )
 VPN_COUNTRIES = tuple(
     c.strip().upper()
@@ -72,6 +73,10 @@ PROFILE_ROOT = os.path.expanduser("~/.chrome-profiles")
 TMP = tempfile.mkdtemp(prefix="smoke-")
 START_TS = time.time()
 ROUTE_DEADLINE = START_TS + ROUTE_BUDGET
+
+VPN_CREDS = os.path.join(TMP, "vg.creds")
+with open(VPN_CREDS, "w") as _f:
+    _f.write("vpn\nvpn\n")
 
 EU_LOCALES = {
     "DE": ("de-DE", "Europe/Berlin"), "AT": ("de-AT", "Europe/Vienna"),
@@ -96,7 +101,8 @@ EU_LOCALES = {
 UA_LOCALES = {
     "US": ("en-US", "America/New_York"), "GB": ("en-GB", "Europe/London"),
     "UK": ("en-GB", "Europe/London"), "CA": ("en-CA", "America/Toronto"),
-    "AU": ("en-AU", "Australia/Sydney"), **EU_LOCALES,
+    "AU": ("en-AU", "Australia/Sydney"), "JP": ("ja-JP", "Asia/Tokyo"),
+    "KR": ("ko-KR", "Asia/Seoul"), **EU_LOCALES,
 }
 
 GOOGLE_TLD = {
@@ -106,6 +112,7 @@ GOOGLE_TLD = {
     "GR": "gr", "SE": "se", "NO": "no", "DK": "dk", "FI": "fi", "EE": "ee",
     "LV": "lv", "LT": "lt", "HR": "hr", "SI": "si", "RS": "rs", "IS": "is",
     "LU": "lu", "TR": "com.tr", "CA": "ca", "AU": "com.au",
+    "JP": "co.jp", "KR": "co.kr",
 }
 
 VPN_STATE = {"ok": False, "server": None, "country": None}
@@ -320,6 +327,16 @@ VOICE_SETS = {
     "tr-TR": [
         ("Google Türkçe", "tr-TR", True, True),
         ("Microsoft Emel Online (Natural) - Turkish (Türkiye)", "tr-TR", True, True),
+    ],
+    "ja-JP": [
+        ("Google 日本語", "ja-JP", True, True),
+        ("Microsoft Nanami Online (Natural) - Japanese (Japan)", "ja-JP", True, True),
+        ("Kyoko", "ja-JP", True, False),
+    ],
+    "ko-KR": [
+        ("Google 한국의", "ko-KR", True, True),
+        ("Microsoft SunHi Online (Natural) - Korean (Korea)", "ko-KR", True, True),
+        ("Yuna", "ko-KR", True, False),
     ],
 }
 VOICE_SETS["en-IE"] = VOICE_SETS["en-GB"]
@@ -648,16 +665,34 @@ def ip_country(ip, timeout=6):
     return ""
 
 
-def fetch_vpngate(countries):
-    """
-    VPN Gate CSV columns:
-      0 HostName 1 IP 2 Score 3 Ping 4 Speed 5 CountryLong 6 CountryShort
-      7 NumVpnSessions 8 Uptime 9 TotalTraffic 10 LogType 11 Operator
-      12 Message 13 OpenVPN_ConfigData_Base64
+def _extract_config(parts):
+    """VPN Gate's config is the last field. Try the last two, validate."""
+    for cand in (parts[-1], parts[-2] if len(parts) > 1 else ""):
+        cand = cand.strip()
+        if not cand:
+            continue
+        try:
+            cfg = base64.b64decode(cand).decode("utf-8", "ignore")
+        except Exception:
+            continue
+        if "remote " in cfg:
+            return cfg
+    return None
 
-    Message/Operator can contain commas, so the config is taken as the LAST
-    field rather than a fixed index.
+
+def _extract_country(parts):
     """
+    CountryShort is a 2-letter uppercase code. CountryLong can contain a
+    comma (e.g. 'Korea, Republic of'), so never trust a fixed index.
+    """
+    for p in parts[5:13]:
+        t = p.strip()
+        if re.fullmatch(r"[A-Z]{2}", t):
+            return t
+    return ""
+
+
+def fetch_vpngate(countries):
     out = []
     try:
         r = requests.get("https://www.vpngate.net/api/iphone/", auth=("vpn", "vpn"), timeout=20,
@@ -669,6 +704,7 @@ def fetch_vpngate(countries):
         return out
 
     total = 0
+    bad_cfg = 0
     for line in text.splitlines():
         if not line or line.startswith("*") or line.startswith("#"):
             continue
@@ -676,19 +712,22 @@ def fetch_vpngate(countries):
         if len(parts) < 14:
             continue
         total += 1
-        cc = parts[6].strip().upper()
+
+        cc = _extract_country(parts)
+        if not cc:
+            continue
         if countries and cc not in countries:
             continue
+
+        cfg = _extract_config(parts)
+        if not cfg:
+            bad_cfg += 1
+            continue
+
         try:
             score = int(parts[2])
         except Exception:
             score = 0
-        try:
-            cfg = base64.b64decode(parts[-1].strip()).decode("utf-8", "ignore")
-        except Exception:
-            continue
-        if "remote " not in cfg:
-            continue
         out.append((cc, parts[1].strip(), score, cfg))
 
     out.sort(key=lambda t: t[2], reverse=True)
@@ -698,10 +737,12 @@ def fetch_vpngate(countries):
         for cc, _, _, _ in out:
             counts[cc] = counts.get(cc, 0) + 1
         top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
-        log(f"[*] VPN Gate: {len(out)} usable of {total} total, "
-            f"{len(counts)} countries (top: {', '.join(f'{c}x{n}' for c, n in top)})")
+        log(f"[*] VPN Gate: {len(out)} usable of {total} parsed, {len(counts)} countries "
+            f"(top: {', '.join(f'{c}x{n}' for c, n in top)})")
+        if bad_cfg:
+            log(f"[*] VPN Gate: {bad_cfg} lines had unreadable configs")
     else:
-        log(f"[!] VPN Gate: 0 usable of {total} total (parsed)")
+        log(f"[!] VPN Gate: 0 usable of {total} parsed ({bad_cfg} bad configs)")
 
     return out
 
@@ -711,7 +752,6 @@ def vpn_connect(countries=VPN_COUNTRIES):
     if not servers:
         return False
 
-    # Spread across countries instead of stacking one.
     by_cc = {}
     for s in servers:
         by_cc.setdefault(s[0], []).append(s)
@@ -722,7 +762,7 @@ def vpn_connect(countries=VPN_COUNTRIES):
                 spread.append(by_cc[cc][i])
 
     for cc, ip, score, raw in spread[:VPN_MAX_TRIES]:
-        if route_time_left() < 22:
+        if route_time_left() < 20:
             log(f"[!] route budget hit ({route_time_left():.0f}s left), stopping VPN tries")
             break
 
@@ -733,6 +773,8 @@ def vpn_connect(countries=VPN_COUNTRIES):
             if s.startswith("auth-user-pass") or s.startswith("verb "):
                 continue
             lines.append(ln)
+        # VPN Gate expects literal vpn/vpn credentials
+        lines.append(f"auth-user-pass {VPN_CREDS}")
         if not any(l.strip().startswith("comp-lzo") for l in lines):
             lines.append("comp-lzo")
         if not any(l.strip().startswith("allow-compression") for l in lines):
@@ -752,7 +794,7 @@ def vpn_connect(countries=VPN_COUNTRIES):
             continue
 
         ok = False
-        for _ in range(9):
+        for _ in range(12):
             time.sleep(1.3)
             ip_now = current_ip(timeout=4)
             if ip_now and ip_now != ROUTE_USED["runner_ip"]:
@@ -769,11 +811,14 @@ def vpn_connect(countries=VPN_COUNTRIES):
 
         try:
             with open(log_path) as f:
-                tail = [x.rstrip() for x in f.readlines()[-6:]]
-            log(f"[!] VPN failed {cc}/{ip}; openvpn says: "
-                + (" | ".join(tail) if tail else "(no output)"))
+                all_lines = [x.rstrip() for x in f.readlines()]
+            interesting = [l for l in all_lines if any(
+                k in l for k in ("AUTH", "TLS Error", "PUSH", "ERROR",
+                                 "SIGTERM", "Connection reset", "Inactivity"))]
+            tail = interesting[-4:] if interesting else all_lines[-4:]
+            log(f"[!] VPN failed {cc}/{ip}: " + (" | ".join(tail) if tail else "(no output)"))
         except Exception:
-            log(f"[!] VPN failed {cc}/{ip}; (log unreadable)")
+            log(f"[!] VPN failed {cc}/{ip}: (log unreadable)")
 
         subprocess.run(["sudo", "pkill", "-f", "openvpn"], timeout=8)
         time.sleep(0.8)
@@ -787,27 +832,24 @@ class ProxyPool:
         self.checked = {}
 
     def load(self):
-        # country-tagged first (higher quality), then bulk lists
-        country_srcs = []
-        for cc in ("us", "gb", "de", "nl"):
-            country_srcs.append(
-                f"https://api.proxyscrape.com/v2/?request=getproxies&protocol=http"
-                f"&timeout=10000&country={cc}&ssl=all&anonymity=all"
-            )
+        country_srcs = [
+            f"https://api.proxyscrape.com/v2/?request=getproxies&protocol=http"
+            f"&timeout=10000&country={cc}&ssl=all&anonymity=all"
+            for cc in ("us", "gb", "de", "nl")
+        ]
         bulk_srcs = [
             "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
             "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
         ]
 
         seen = set()
-        head = []
-        tail = []
+        head, tail = [], []
 
         for url in country_srcs:
             if route_time_left() < 15:
                 break
             try:
-                r = requests.get(url, timeout=10)
+                r = requests.get(url, timeout=8)
                 for ln in r.text.splitlines():
                     ln = ln.strip()
                     if ln and ":" in ln and ln not in seen:
@@ -820,7 +862,7 @@ class ProxyPool:
             if route_time_left() < 10:
                 break
             try:
-                r = requests.get(url, timeout=10)
+                r = requests.get(url, timeout=8)
                 for ln in r.text.splitlines():
                     ln = ln.strip()
                     if ln and ":" in ln and re.match(r"^\d{1,3}(\.\d{1,3}){3}:", ln) and ln not in seen:
@@ -847,7 +889,7 @@ class ProxyPool:
         self.checked[proxy] = res
         return res
 
-    def next(self, prefer=None, max_tries=14):
+    def next(self, prefer=None, max_tries=12):
         prefer = prefer or tuple(UA_LOCALES.keys())
         prefer = tuple(p.upper() for p in prefer)
         fallback = None
@@ -893,7 +935,7 @@ def create_driver(fp, proxy=None):
     driver = uc.Chrome(options=opts, browser_executable_path=BROWSER_PATH,
                        version_main=BROWSER_MAJOR, use_subprocess=True)
 
-    driver.set_page_load_timeout(50)
+    driver.set_page_load_timeout(40)
     driver.set_script_timeout(25)
 
     try:
@@ -1131,7 +1173,7 @@ def accept_google_consent(driver):
                 if b.is_displayed():
                     hover(driver, b)
                     click_at(driver, b)
-                    time.sleep(random.uniform(0.6, 1.2))
+                    time.sleep(random.uniform(0.5, 1.0))
                     return True
         except Exception:
             continue
@@ -1146,6 +1188,23 @@ def _is_our_serp_link(href):
     return href.startswith("http") or href.startswith("/url?")
 
 
+def _fast_get(driver, url, timeout=22):
+    try:
+        driver.set_page_load_timeout(timeout)
+    except Exception:
+        pass
+    try:
+        driver.get(url)
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            driver.set_page_load_timeout(40)
+        except Exception:
+            pass
+
+
 def enter_via_google(driver, term=None):
     """Search Google, click our own organic result. Feeds Search Console."""
     cc = ROUTE_USED.get("country") or "US"
@@ -1154,19 +1213,20 @@ def enter_via_google(driver, term=None):
     candidates = [term] if term else [random.choice(SEARCH_TERMS)]
     candidates.append(random.choice(BRAND_TERMS))
 
+    log(f"    [*] google entry attempt via google.{tld}")
+
     for q in candidates:
-        if time_left() < 40:
+        if time_left() < 35:
+            log("    [!] google entry: out of budget")
             break
 
-        try:
-            driver.get(f"https://www.google.{tld}/search?q={quote_plus(q)}&num=30")
-        except Exception:
+        if not _fast_get(driver, f"https://www.google.{tld}/search?q={quote_plus(q)}&num=30"):
+            log(f"    [!] google.{tld} load timed out for '{q}'")
             continue
-        time.sleep(random.uniform(1.5, 2.6))
+        time.sleep(random.uniform(1.2, 2.2))
 
         accept_google_consent(driver)
-        time.sleep(random.uniform(0.4, 1.0))
-        scroll_burst(driver, random.uniform(1.2, 2.4))
+        scroll_burst(driver, random.uniform(1.0, 2.0))
 
         for page in range(2):
             try:
@@ -1181,7 +1241,7 @@ def enter_via_google(driver, term=None):
                         continue
                     time.sleep(random.uniform(0.25, 0.7))
                     click_at(driver, a)
-                    time.sleep(random.uniform(1.5, 2.6))
+                    time.sleep(random.uniform(1.2, 2.2))
                     if DOMAIN in (driver.current_url or ""):
                         log(f"    [*] entered via google.{tld}: '{q}'")
                         return True
@@ -1194,7 +1254,7 @@ def enter_via_google(driver, term=None):
                     if nxt and nxt[0].is_displayed():
                         hover(driver, nxt[0])
                         click_at(driver, nxt[0])
-                        time.sleep(random.uniform(1.2, 2.2))
+                        time.sleep(random.uniform(1.0, 2.0))
                 except Exception:
                     pass
 
@@ -1276,11 +1336,9 @@ def money_step(driver, click_now):
     if USE_GOOGLE_ENTRY:
         entered = enter_via_google(driver)
     if not entered:
-        try:
-            driver.get(url)
-        except Exception as e:
-            log(f"    [!] nav issue: {str(e)[:60]}")
-        time.sleep(random.uniform(1.2, 2.4))
+        log("    [*] direct nav fallback")
+        _fast_get(driver, url, timeout=25)
+    time.sleep(random.uniform(1.0, 2.2))
 
     for txt in ("Accept", "Accept all", "Got it", "OK", "Agree"):
         try:
@@ -1308,7 +1366,7 @@ def money_step(driver, click_now):
     else:
         log("    [*] no ad -> viewing page")
 
-    dwell(driver, 6, 16)
+    dwell(driver, 6, 15)
     return "view", url
 
 
@@ -1434,14 +1492,14 @@ def main():
         if kind == "click":
             result["clicks"] += 1
 
-        while len(result["urls"]) < views and time_left() > 45 and not STOP:
+        while len(result["urls"]) < views and time_left() > 40 and not STOP:
             url = random.choice(LANDING_URLS)
             log(f"[*] extra view -> {url} | left {time_left():.0f}s")
             try:
-                driver.get(url)
-                time.sleep(random.uniform(1.2, 2.4))
+                _fast_get(driver, url, timeout=25)
+                time.sleep(random.uniform(1.0, 2.0))
                 scroll_burst(driver, random.uniform(1.5, 3.5))
-                dwell(driver, 5, 13)
+                dwell(driver, 5, 12)
                 result["views"] += 1
                 result["urls"].append(url)
             except Exception as e:
