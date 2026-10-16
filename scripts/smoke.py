@@ -43,6 +43,7 @@ from selenium.webdriver.common.keys import Keys
 SITE       = os.environ.get("SITE", "https://www.abdulsamad.shop").rstrip("/")
 SITE_HOST  = re.sub(r"^https?://", "", SITE).split("/")[0]
 DOMAIN     = SITE_HOST[4:] if SITE_HOST.startswith("www.") else SITE_HOST
+SITE_MATCH = "abdulsamad"          # distinctive fragment, matches any subdomain
 
 RUN_ID     = os.environ.get("GITHUB_RUN_ID", str(int(time.time())))
 RUN_NUMBER = os.environ.get("GITHUB_RUN_NUMBER", "0")
@@ -53,8 +54,8 @@ TRIGGER_UTC = os.environ.get("TRIGGER_UTC", "")
 VIEWS_PER_RUN    = int(os.environ.get("VIEWS_PER_RUN", "3"))
 IDENTITY_COUNT   = int(os.environ.get("IDENTITY_COUNT", "5"))
 MAX_RUN_SECONDS  = int(os.environ.get("MAX_RUN_SECONDS", "175"))
-VPN_MAX_TRIES    = int(os.environ.get("VPN_MAX_TRIES", "2"))
-ROUTE_BUDGET     = int(os.environ.get("ROUTE_BUDGET", "60"))
+VPN_MAX_TRIES    = int(os.environ.get("VPN_MAX_TRIES", "4"))
+ROUTE_BUDGET     = int(os.environ.get("ROUTE_BUDGET", "70"))
 USE_GOOGLE_ENTRY = os.environ.get("USE_GOOGLE_ENTRY", "true").lower() in ("1", "true", "yes")
 
 DEFAULT_VPN_COUNTRIES = (
@@ -182,6 +183,7 @@ LANDING_PATHS = [
 
 LANDING_URLS = [SITE + p for p in LANDING_PATHS]
 
+# Brand query first -- most likely to actually surface the site.
 BRAND_TERMS = ["abdulsamad.shop", "abdulsamad shop", "abdulsamad fonts", "abdulsamad"]
 
 SEARCH_TERMS = [
@@ -757,19 +759,22 @@ def vpn_connect(countries=VPN_COUNTRIES):
     if not servers:
         return False
 
+    # Round-robin across countries so a batch of full US nodes is not fatal.
     by_cc = {}
     for s in servers:
         by_cc.setdefault(s[0], []).append(s)
     spread = []
-    for i in range(3):
+    depth = max(1, min(6, max(len(v) for v in by_cc.values())))
+    for i in range(depth):
         for cc in list(by_cc.keys()):
             if len(by_cc[cc]) > i:
                 spread.append(by_cc[cc][i])
 
-    for cc, ip, score, raw in spread[:VPN_MAX_TRIES]:
-        if route_time_left() < 18:
-            log(f"[!] route budget hit ({route_time_left():.0f}s left), stopping VPN tries")
+    tried = 0
+    for cc, ip, score, raw in spread:
+        if tried >= VPN_MAX_TRIES or route_time_left() < 16:
             break
+        tried += 1
 
         cfg_path = os.path.join(TMP, "vg.ovpn")
         lines = []
@@ -783,7 +788,7 @@ def vpn_connect(countries=VPN_COUNTRIES):
             lines.append("comp-lzo")
         if not any(l.strip().startswith("allow-compression") for l in lines):
             lines.append("allow-compression yes")
-        lines.append("connect-retry-max 2")
+        lines.append("connect-retry-max 1")
 
         with open(cfg_path, "w") as f:
             f.write("\n".join(lines) + "\n")
@@ -799,8 +804,8 @@ def vpn_connect(countries=VPN_COUNTRIES):
             continue
 
         ok = False
-        for _ in range(10):
-            time.sleep(1.3)
+        for _ in range(9):
+            time.sleep(1.2)
             ip_now = current_ip(timeout=4)
             if ip_now and ip_now != ROUTE_USED["runner_ip"]:
                 cc_now = ip_country(ip_now)
@@ -814,19 +819,26 @@ def vpn_connect(countries=VPN_COUNTRIES):
         if ok:
             return True
 
+        reason = "unknown"
         try:
             with open(log_path) as f:
-                all_lines = [x.rstrip() for x in f.readlines()]
-            interesting = [l for l in all_lines if any(
-                k in l for k in ("AUTH", "TLS Error", "PUSH", "ERROR",
-                                 "SIGTERM", "Connection reset", "Inactivity"))]
-            tail = interesting[-3:] if interesting else all_lines[-3:]
-            log(f"[!] VPN failed {cc}/{ip} ({proto}): " + (" | ".join(tail) if tail else "(no output)"))
+                txt = f.read()
+            if "AUTH_FAILED" in txt:
+                reason = "AUTH_FAILED (node full)"
+            elif "TLS Error" in txt or "tls-error" in txt:
+                reason = "TLS error"
+            elif "Connection reset" in txt:
+                reason = "reset"
+            elif "Inactivity" in txt or "timeout" in txt.lower():
+                reason = "timeout"
+            elif "Attempting to establish" in txt:
+                reason = "tcp connect stuck"
         except Exception:
-            log(f"[!] VPN failed {cc}/{ip} ({proto}): (log unreadable)")
+            pass
+        log(f"[!] VPN failed {cc}/{ip} ({proto}): {reason}")
 
         subprocess.run(["sudo", "pkill", "-f", "openvpn"], timeout=8)
-        time.sleep(0.6)
+        time.sleep(0.5)
 
     return False
 
@@ -844,7 +856,6 @@ class ProxyPool:
         ]
         bulk_srcs = [
             "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-            "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
         ]
 
         seen = set()
@@ -854,7 +865,7 @@ class ProxyPool:
             if route_time_left() < 12:
                 break
             try:
-                r = requests.get(url, timeout=7)
+                r = requests.get(url, timeout=6)
                 for ln in r.text.splitlines():
                     ln = ln.strip()
                     if ln and ":" in ln and ln not in seen:
@@ -867,7 +878,7 @@ class ProxyPool:
             if route_time_left() < 8:
                 break
             try:
-                r = requests.get(url, timeout=7)
+                r = requests.get(url, timeout=6)
                 for ln in r.text.splitlines():
                     ln = ln.strip()
                     if ln and ":" in ln and re.match(r"^\d{1,3}(\.\d{1,3}){3}:", ln) and ln not in seen:
@@ -886,7 +897,7 @@ class ProxyPool:
             return self.checked[proxy]
         try:
             r = requests.get("http://ip-api.com/json/?fields=status,countryCode,query",
-                             proxies={"http": f"http://{proxy}", "https": f"http://{proxy}"}, timeout=4)
+                             proxies={"http": f"http://{proxy}", "https": f"http://{proxy}"}, timeout=3)
             d = r.json()
             res = (d.get("countryCode", ""), d.get("query", "")) if d.get("status") == "success" else None
         except Exception:
@@ -894,12 +905,12 @@ class ProxyPool:
         self.checked[proxy] = res
         return res
 
-    def next(self, prefer=None, max_tries=12):
+    def next(self, prefer=None, max_tries=16):
         prefer = prefer or tuple(UA_LOCALES.keys())
         prefer = tuple(p.upper() for p in prefer)
         fallback = None
         for proxy in self.items[:max_tries]:
-            if route_time_left() < 5:
+            if route_time_left() < 4:
                 break
             res = self.check(proxy)
             if not res:
@@ -1154,7 +1165,7 @@ def click_internal_link(driver):
         good = []
         for a in driver.find_elements(By.CSS_SELECTOR, "a[href]"):
             try:
-                if DOMAIN in (a.get_attribute("href") or "") and a.is_displayed():
+                if SITE_MATCH in (a.get_attribute("href") or "") and a.is_displayed():
                     good.append(a)
             except Exception:
                 continue
@@ -1186,11 +1197,35 @@ def accept_google_consent(driver):
 
 
 def _is_our_serp_link(href):
-    if not href or DOMAIN not in href:
+    if not href or SITE_MATCH not in href:
         return False
     if "/search?" in href:
         return False
+    if "google." in href and "/url?" not in href:
+        return False
     return href.startswith("http") or href.startswith("/url?")
+
+
+def _serp_diag(driver, q):
+    try:
+        links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+        hits = 0
+        sample = []
+        for a in links[:400]:
+            try:
+                h = a.get_attribute("href") or ""
+            except Exception:
+                continue
+            if SITE_MATCH in h and "/search?" not in h:
+                hits += 1
+                if len(sample) < 2:
+                    sample.append(h[:70])
+        title = (driver.title or "")[:60]
+        log(f"    [*] SERP '{q}': {len(links)} links, {hits} ours, title={title!r}")
+        for s in sample:
+            log(f"        -> {s}")
+    except Exception:
+        pass
 
 
 def _fast_get(driver, url, timeout=22):
@@ -1215,7 +1250,8 @@ def enter_via_google(driver, term=None):
     cc = ROUTE_USED.get("country") or "US"
     tld = GOOGLE_TLD.get(cc, "com")
 
-    candidates = [term] if term else [random.choice(SEARCH_TERMS)]
+    candidates = []
+    candidates.append(term if term else random.choice(SEARCH_TERMS))
     candidates.append(random.choice(BRAND_TERMS))
 
     log(f"    [*] google entry attempt via google.{tld}")
@@ -1225,13 +1261,15 @@ def enter_via_google(driver, term=None):
             log("    [!] google entry: out of budget")
             break
 
-        if not _fast_get(driver, f"https://www.google.{tld}/search?q={quote_plus(q)}&num=30"):
+        if not _fast_get(driver,
+                         f"https://www.google.{tld}/search?q={quote_plus(q)}&hl=en&num=20"):
             log(f"    [!] google.{tld} load timed out for '{q}'")
             continue
-        time.sleep(random.uniform(1.2, 2.2))
+        time.sleep(random.uniform(1.4, 2.4))
 
         accept_google_consent(driver)
         scroll_burst(driver, random.uniform(1.0, 2.0))
+        _serp_diag(driver, q)
 
         for page in range(2):
             try:
@@ -1247,7 +1285,7 @@ def enter_via_google(driver, term=None):
                     time.sleep(random.uniform(0.25, 0.7))
                     click_at(driver, a)
                     time.sleep(random.uniform(1.2, 2.2))
-                    if DOMAIN in (driver.current_url or ""):
+                    if SITE_MATCH in (driver.current_url or ""):
                         log(f"    [*] entered via google.{tld}: '{q}'")
                         return True
             except Exception:
@@ -1515,7 +1553,6 @@ def main():
         log(f"[!] fatal: {e}")
         result["errors"].append(str(e)[:140])
     finally:
-        # write the summary BEFORE quitting, so a SIGKILL cannot lose it
         result.update({
             "run": RUN_NUMBER, "utc": now.isoformat(), "slot": slot_index(now),
             "route": ROUTE_USED, "vpn_ok": VPN_STATE["ok"], "identity": fp["profile"],
