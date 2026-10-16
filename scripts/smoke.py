@@ -10,6 +10,9 @@ GA4 record the visit as google / organic instead of Direct.
 
 Route order (4 tiers):
   1. residential proxy  2. VPN Gate  3. country-matched proxy  4. direct
+
+VPN pool spans US, UK and Europe. Locale, timezone, browser language and
+Google TLD are all derived from the exit country so nothing mismatches.
 """
 
 import base64
@@ -59,18 +62,78 @@ IDENTITY_COUNT   = int(os.environ.get("IDENTITY_COUNT", "5"))
 MAX_RUN_SECONDS  = int(os.environ.get("MAX_RUN_SECONDS", "200"))
 VPN_MAX_TRIES    = int(os.environ.get("VPN_MAX_TRIES", "3"))
 USE_GOOGLE_ENTRY = os.environ.get("USE_GOOGLE_ENTRY", "true").lower() in ("1", "true", "yes")
-VPN_COUNTRIES    = tuple(
-    c.strip().upper() for c in os.environ.get("VPN_COUNTRIES", "US,GB,UK").split(",") if c.strip()
+
+# US + UK + Europe. VPN Gate has decent DE/FR/NL/SE coverage.
+DEFAULT_VPN_COUNTRIES = (
+    "US,GB,UK,"
+    "DE,FR,NL,SE,CH,AT,BE,IT,ES,PL,CZ,RO,HU,FI,NO,DK,IE,PT,GR,TR,"
+    "SK,BG,HR,SI,EE,LV,LT,RS,UA,IS,LU,MT,CY"
+)
+VPN_COUNTRIES = tuple(
+    c.strip().upper()
+    for c in os.environ.get("VPN_COUNTRIES", DEFAULT_VPN_COUNTRIES).split(",")
+    if c.strip()
 )
 
 PROFILE_ROOT = os.path.expanduser("~/.chrome-profiles")
 TMP = tempfile.mkdtemp(prefix="smoke-")
 START_TS = time.time()
 
+# ------------------------------------------------- locale / timezone by country
+
+EU_LOCALES = {
+    "DE": ("de-DE", "Europe/Berlin"),
+    "AT": ("de-AT", "Europe/Vienna"),
+    "CH": ("de-CH", "Europe/Zurich"),
+    "FR": ("fr-FR", "Europe/Paris"),
+    "BE": ("nl-BE", "Europe/Brussels"),
+    "NL": ("nl-NL", "Europe/Amsterdam"),
+    "IT": ("it-IT", "Europe/Rome"),
+    "ES": ("es-ES", "Europe/Madrid"),
+    "PT": ("pt-PT", "Europe/Lisbon"),
+    "PL": ("pl-PL", "Europe/Warsaw"),
+    "CZ": ("cs-CZ", "Europe/Prague"),
+    "SK": ("sk-SK", "Europe/Bratislava"),
+    "HU": ("hu-HU", "Europe/Budapest"),
+    "RO": ("ro-RO", "Europe/Bucharest"),
+    "BG": ("bg-BG", "Europe/Sofia"),
+    "GR": ("el-GR", "Europe/Athens"),
+    "HR": ("hr-HR", "Europe/Zagreb"),
+    "SI": ("sl-SI", "Europe/Ljubljana"),
+    "RS": ("sr-RS", "Europe/Belgrade"),
+    "UA": ("uk-UA", "Europe/Kyiv"),
+    "SE": ("sv-SE", "Europe/Stockholm"),
+    "NO": ("nb-NO", "Europe/Oslo"),
+    "DK": ("da-DK", "Europe/Copenhagen"),
+    "FI": ("fi-FI", "Europe/Helsinki"),
+    "IS": ("is-IS", "Atlantic/Reykjavik"),
+    "EE": ("et-EE", "Europe/Tallinn"),
+    "LV": ("lv-LV", "Europe/Riga"),
+    "LT": ("lt-LT", "Europe/Vilnius"),
+    "IE": ("en-IE", "Europe/Dublin"),
+    "LU": ("fr-LU", "Europe/Luxembourg"),
+    "MT": ("en-MT", "Europe/Malta"),
+    "CY": ("el-CY", "Asia/Nicosia"),
+    "TR": ("tr-TR", "Europe/Istanbul"),
+}
+
 UA_LOCALES = {
     "US": ("en-US", "America/New_York"),
     "GB": ("en-GB", "Europe/London"),
     "UK": ("en-GB", "Europe/London"),
+    "CA": ("en-CA", "America/Toronto"),
+    "AU": ("en-AU", "Australia/Sydney"),
+    **EU_LOCALES,
+}
+
+# google.<tld> to use for the search entry. Only well-known ones; rest -> com.
+GOOGLE_TLD = {
+    "GB": "co.uk", "UK": "co.uk", "IE": "ie", "DE": "de", "AT": "at", "CH": "ch",
+    "FR": "fr", "BE": "be", "NL": "nl", "IT": "it", "ES": "es", "PT": "pt",
+    "PL": "pl", "CZ": "cz", "SK": "sk", "HU": "hu", "RO": "ro", "BG": "bg",
+    "GR": "gr", "SE": "se", "NO": "no", "DK": "dk", "FI": "fi", "EE": "ee",
+    "LV": "lv", "LT": "lt", "HR": "hr", "SI": "si", "RS": "rs", "IS": "is",
+    "LU": "lu", "TR": "com.tr", "CA": "ca", "AU": "com.au",
 }
 
 VPN_STATE = {"ok": False, "server": None, "country": None}
@@ -136,8 +199,6 @@ LANDING_PATHS = [
 
 LANDING_URLS = [SITE + p for p in LANDING_PATHS]
 
-# Brand queries are near-guaranteed rank #1, which is what actually produces
-# a Search Console click. Generic queries supply the impression variety.
 BRAND_TERMS = [
     "abdulsamad.shop",
     "abdulsamad shop",
@@ -220,20 +281,111 @@ log(f"[*] Browser: {BRAND} {BROWSER_VERSION} at {BROWSER_PATH}")
 # ================================================================ SPEECH VOICES
 
 VOICE_SETS = {
-    "US": [
+    "en-US": [
         ("Google US English", "en-US", True, True),
         ("Microsoft Aria Online (Natural) - English (United States)", "en-US", True, True),
         ("Alex", "en-US", True, False),
         ("Samantha", "en-US", True, False),
     ],
-    "GB": [
+    "en-GB": [
         ("Google UK English Female", "en-GB", True, True),
         ("Google UK English Male", "en-GB", True, True),
         ("Daniel", "en-GB", True, False),
         ("Kate", "en-GB", True, False),
     ],
+    "de-DE": [
+        ("Google Deutsch", "de-DE", True, True),
+        ("Microsoft Katja Online (Natural) - German (Germany)", "de-DE", True, True),
+        ("Anna", "de-DE", True, False),
+    ],
+    "fr-FR": [
+        ("Google français", "fr-FR", True, True),
+        ("Microsoft Denise Online (Natural) - French (France)", "fr-FR", True, True),
+        ("Thomas", "fr-FR", True, False),
+    ],
+    "nl-NL": [
+        ("Google Nederlands", "nl-NL", True, True),
+        ("Microsoft Fenna Online (Natural) - Dutch (Netherlands)", "nl-NL", True, True),
+    ],
+    "es-ES": [
+        ("Google español", "es-ES", True, True),
+        ("Microsoft Elvira Online (Natural) - Spanish (Spain)", "es-ES", True, True),
+        ("Monica", "es-ES", True, False),
+    ],
+    "it-IT": [
+        ("Google italiano", "it-IT", True, True),
+        ("Microsoft Elsa Online (Natural) - Italian (Italy)", "it-IT", True, True),
+        ("Alice", "it-IT", True, False),
+    ],
+    "pt-PT": [
+        ("Google português", "pt-PT", True, True),
+        ("Microsoft Raquel Online (Natural) - Portuguese (Portugal)", "pt-PT", True, True),
+    ],
+    "pl-PL": [
+        ("Google polski", "pl-PL", True, True),
+        ("Microsoft Zofia Online (Natural) - Polish (Poland)", "pl-PL", True, True),
+    ],
+    "cs-CZ": [
+        ("Google čeština", "cs-CZ", True, True),
+        ("Microsoft Vlasta Online (Natural) - Czech (Czechia)", "cs-CZ", True, True),
+    ],
+    "sk-SK": [
+        ("Google slovenčina", "sk-SK", True, True),
+    ],
+    "hu-HU": [
+        ("Google magyar", "hu-HU", True, True),
+        ("Microsoft Noemi Online (Natural) - Hungarian (Hungary)", "hu-HU", True, True),
+    ],
+    "ro-RO": [
+        ("Google română", "ro-RO", True, True),
+        ("Microsoft Alina Online (Natural) - Romanian (Romania)", "ro-RO", True, True),
+    ],
+    "bg-BG": [
+        ("Google български", "bg-BG", True, True),
+    ],
+    "el-GR": [
+        ("Google ελληνικά", "el-GR", True, True),
+        ("Microsoft Athina Online (Natural) - Greek (Greece)", "el-GR", True, True),
+    ],
+    "sv-SE": [
+        ("Google svenska", "sv-SE", True, True),
+        ("Microsoft Sofie Online (Natural) - Swedish (Sweden)", "sv-SE", True, True),
+    ],
+    "nb-NO": [
+        ("Google norsk", "nb-NO", True, True),
+        ("Microsoft Pernille Online (Natural) - Norwegian (Norway)", "nb-NO", True, True),
+    ],
+    "da-DK": [
+        ("Google dansk", "da-DK", True, True),
+        ("Microsoft Christel Online (Natural) - Danish (Denmark)", "da-DK", True, True),
+    ],
+    "fi-FI": [
+        ("Google suomi", "fi-FI", True, True),
+        ("Microsoft Satu Online (Natural) - Finnish (Finland)", "fi-FI", True, True),
+    ],
+    "tr-TR": [
+        ("Google Türkçe", "tr-TR", True, True),
+        ("Microsoft Emel Online (Natural) - Turkish (Türkiye)", "tr-TR", True, True),
+    ],
 }
-VOICE_SETS["UK"] = VOICE_SETS["GB"]
+VOICE_SETS["en-IE"] = VOICE_SETS["en-GB"]
+VOICE_SETS["en-MT"] = VOICE_SETS["en-GB"]
+VOICE_SETS["de-AT"] = VOICE_SETS["de-DE"]
+VOICE_SETS["de-CH"] = VOICE_SETS["de-DE"]
+VOICE_SETS["fr-LU"] = VOICE_SETS["fr-FR"]
+VOICE_SETS["nl-BE"] = VOICE_SETS["nl-NL"]
+VOICE_SETS["el-CY"] = VOICE_SETS["el-GR"]
+
+
+def voices_for(lang):
+    if lang in VOICE_SETS:
+        return VOICE_SETS[lang]
+    pre = lang.split("-")[0]
+    for k, v in VOICE_SETS.items():
+        if k.startswith(pre + "-"):
+            return v
+    return VOICE_SETS["en-GB"]
+
 
 # =========================================================== FINGERPRINT LIBRARY
 
@@ -301,7 +453,7 @@ def generate_fingerprint(seed):
         "screen_w": w, "screen_h": h, "avail_h": h - taskbar,
         "border_w": border, "chrome_h": chrome_h,
         "gpu_vendor": gpu[0], "gpu_renderer": gpu[1], "color_depth": 24,
-        "voices": VOICE_SETS.get("US" if lang == "en-US" else "GB", VOICE_SETS["US"]),
+        "voices": voices_for(lang),
         "profile": f"id-{seed % IDENTITY_COUNT}",
     }
 
@@ -570,7 +722,17 @@ def fetch_vpngate(countries):
         out.append((cc, parts[1], score, cfg))
 
     out.sort(key=lambda t: t[2], reverse=True)
-    log(f"[*] VPN Gate: {len(out)} unique {('/'.join(countries) or 'any')} servers")
+
+    if out:
+        counts = {}
+        for cc, _, _, _ in out:
+            counts[cc] = counts.get(cc, 0) + 1
+        top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        log(f"[*] VPN Gate: {len(out)} servers across {len(counts)} countries "
+            f"(top: {', '.join(f'{c}x{n}' for c, n in top)})")
+    else:
+        log("[!] VPN Gate: 0 matching servers")
+
     return out
 
 
@@ -580,7 +742,17 @@ def vpn_connect(countries=VPN_COUNTRIES):
     if not servers:
         return False
 
-    for cc, ip, score, raw in servers[:VPN_MAX_TRIES]:
+    # Try a spread of countries rather than three from the same one.
+    by_cc = {}
+    for s in servers:
+        by_cc.setdefault(s[0], []).append(s)
+    spread = []
+    for i in range(3):
+        for cc in list(by_cc.keys()):
+            if len(by_cc[cc]) > i:
+                spread.append(by_cc[cc][i])
+
+    for cc, ip, score, raw in spread[:VPN_MAX_TRIES]:
         if time_left() < 95:
             break
 
@@ -675,7 +847,8 @@ class ProxyPool:
         self.checked[proxy] = res
         return res
 
-    def next(self, prefer=("US", "GB", "UK"), max_tries=15):
+    def next(self, prefer=None, max_tries=20):
+        prefer = prefer or tuple(list(UA_LOCALES.keys()) + ["UK"])
         prefer = tuple(p.upper() for p in prefer)
         fallback = None
         for proxy in self.items[:max_tries]:
@@ -952,7 +1125,7 @@ def click_internal_link(driver):
 
 def accept_google_consent(driver):
     for sel in ("button#L2AGLb", "button[aria-label*='Accept']", "button[aria-label*='Agree']",
-                "div[role=button][id*='L2AGLb']"):
+                "div[role=button][id*='L2AGLb']", "button[id='W0wltc']"):
         try:
             for b in driver.find_elements(By.CSS_SELECTOR, sel):
                 if b.is_displayed():
@@ -980,7 +1153,8 @@ def enter_via_google(driver, term=None):
     Search Console impression + click and sends a google.com referrer.
     Tries a generic query first, then falls back to a brand query.
     """
-    tld = "co.uk" if ROUTE_USED.get("country") in ("GB", "UK") else "com"
+    cc = ROUTE_USED.get("country") or "US"
+    tld = GOOGLE_TLD.get(cc, "com")
 
     candidates = [term] if term else [random.choice(SEARCH_TERMS)]
     candidates.append(random.choice(BRAND_TERMS))
@@ -1017,7 +1191,7 @@ def enter_via_google(driver, term=None):
                     click_at(driver, a)
                     time.sleep(random.uniform(1.8, 3.2))
                     if DOMAIN in (driver.current_url or ""):
-                        log(f"    [*] entered via google: '{q}'")
+                        log(f"    [*] entered via google.{tld}: '{q}'")
                         return True
             except Exception:
                 pass
@@ -1106,8 +1280,6 @@ def money_step(driver, click_now):
     url = random.choice(LANDING_URLS)
     log(f"[*] MONEY STEP -> {url} | left {time_left():.0f}s")
 
-    # Always enter via Google when we intend to click -- that is what puts a
-    # click into Search Console and a google/organic referrer into GA4.
     p_google = 0.9 if click_now else 0.6
     entered = False
     if USE_GOOGLE_ENTRY and random.random() < p_google:
@@ -1199,6 +1371,7 @@ def main():
     log("=" * 68)
     log(f"[*] run {RUN_NUMBER} id {RUN_ID} event {EVENT_NAME}")
     log(f"[*] utc {now.isoformat()} slot {slot_index(now)} force_click={FORCE_CLICK}")
+    log(f"[*] vpn pool: {len(VPN_COUNTRIES)} countries")
     log("=" * 68)
 
     clicks_today, p_slot, views = traffic_model(now)
@@ -1238,10 +1411,19 @@ def main():
 
     log(f"[*] route: {ROUTE_USED['tier']} ({ROUTE_USED['detail']}) | left {time_left():.0f}s")
 
+    # Match locale / timezone / language / voices to the exit country.
     cc = ROUTE_USED.get("country") or "US"
     if cc in UA_LOCALES:
-        lang, tz = UA_LOCALES[cc]
-        fp["language"], fp["languages"], fp["timezone"] = lang, [lang, lang.split("-")[0]], tz
+        local_lang, local_tz = UA_LOCALES[cc]
+        if cc in EU_LOCALES and not local_lang.startswith("en") and random.random() < 0.45:
+            lang, tz = "en-GB", local_tz          # English UI, local timezone
+        else:
+            lang, tz = local_lang, local_tz
+        fp["language"] = lang
+        fp["languages"] = [lang, lang.split("-")[0]]
+        fp["timezone"] = tz
+        fp["voices"] = voices_for(lang)
+        log(f"[*] locale {lang} / {tz} for exit {cc}")
 
     result = {"views": 0, "clicks": 0, "urls": [], "errors": []}
     driver = None
@@ -1249,7 +1431,6 @@ def main():
     try:
         driver = create_driver(fp, proxy=proxy)
 
-        # ---- 1. money step, front-loaded ----
         if click_now and time_left() > 40:
             kind, url = money_step(driver, click_now)
             result["views"] += 1
@@ -1267,7 +1448,6 @@ def main():
             except Exception as e:
                 result["errors"].append(f"warmup: {str(e)[:60]}")
 
-        # ---- 2. extra views if budget allows ----
         while len(result["urls"]) < views and time_left() > 50 and not STOP:
             url = random.choice(LANDING_URLS)
             log(f"[*] extra view -> {url} | left {time_left():.0f}s")
@@ -1295,7 +1475,8 @@ def main():
         result.update({
             "run": RUN_NUMBER, "utc": now.isoformat(), "slot": slot_index(now),
             "route": ROUTE_USED, "vpn_ok": VPN_STATE["ok"], "identity": fp["profile"],
-            "click_gate": click_now, "clicks_today_model": clicks_today,
+            "locale": fp["language"], "click_gate": click_now,
+            "clicks_today_model": clicks_today,
             "seconds": round(time.time() - START_TS, 1),
         })
         try:
