@@ -3,15 +3,12 @@
 """
 smoke.py - anti-detection AdSense traffic bot for abdulsamad.shop
 
-Session start
-  google_health_check() proves Google is reachable from the chosen route and
-  solves the /sorry/ reCAPTCHA (frame-aware) ONCE. The abuse-exemption cookie
-  then persists for the rest of the session and across runs via the profile.
+openvpn is launched WITHOUT nested sudo when we are already root, and its
+stdout/stderr are redirected straight into the log so a silent start is
+impossible to miss.
 
-Phase 1 - IMPRESSIONS (only if Google is healthy)
-Phase 2 - VIEWS/CLICKS (always runs, so a Google outage can't waste a run)
-
-Circuit breaker: 3 consecutive Google failures ends phase 1.
+The /sorry/ reCAPTCHA is clicked with real CDP mouse events (not .click()),
+because reCAPTCHA ignores synthetic JS clicks.
 """
 
 from __future__ import annotations
@@ -83,8 +80,8 @@ MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "540"))
 NO_AD_PAGE_CAP = int(os.environ.get("NO_AD_PAGE_CAP", "8"))
 
 PHASE1_MAX_SECONDS = int(os.environ.get("PHASE1_MAX_SECONDS", "180"))
+GOOGLE_HEALTH_SECONDS = int(os.environ.get("GOOGLE_HEALTH_SECONDS", "70"))
 GOOGLE_FAIL_LIMIT = int(os.environ.get("GOOGLE_FAIL_LIMIT", "3"))
-GOOGLE_PASS_CAP = int(os.environ.get("GOOGLE_PASS_CAP", "25"))
 
 CLICK_THROUGH_RATE = float(os.environ.get("CLICK_THROUGH_RATE", "0.45"))
 AD_CLICK_RATE = float(os.environ.get("AD_CLICK_RATE", "0.8"))
@@ -94,10 +91,10 @@ DAILY_RUN_TARGET = int(os.environ.get(
     "DAILY_RUN_TARGET", str(max(DAILY_CLICK_TARGET // max(TARGET_CLICKS, 1), 1))))
 RUNS_PER_DAY = int(os.environ.get("RUNS_PER_DAY", "104"))
 
-VPN_BUDGET = int(os.environ.get("VPN_BUDGET", "100"))
-VPN_TRY_TIMEOUT = int(os.environ.get("VPN_TRY_TIMEOUT", "18"))
-PROXY_BUDGET = int(os.environ.get("PROXY_BUDGET", "45"))
+VPN_BUDGET = int(os.environ.get("VPN_BUDGET", "120"))
+VPN_TRY_TIMEOUT = int(os.environ.get("VPN_TRY_TIMEOUT", "22"))
 VPN_MAX_TRIES = int(os.environ.get("VPN_MAX_TRIES", "5"))
+PROXY_BUDGET = int(os.environ.get("PROXY_BUDGET", "45"))
 PROXY_PREFLIGHT = int(os.environ.get("PROXY_PREFLIGHT", "5"))
 
 FORCE_CLICK = env_flag("FORCE_CLICK")
@@ -114,6 +111,9 @@ VPN_DIR = tempfile.mkdtemp(prefix="vpn-")
 CREDS_PATH = os.path.join(VPN_DIR, "creds.txt")
 VPN_LOG = os.path.join(VPN_DIR, "openvpn.log")
 
+OPENVPN_BIN = shutil.which("openvpn") or "/usr/sbin/openvpn"
+IS_ROOT = (os.geteuid() == 0)
+
 DEADLINE = START + MAX_RUN_SECONDS
 
 PAGES = [
@@ -129,7 +129,6 @@ PAGES = [
     "/math-symbols", "/bracket-symbols", "/misc-symbols", "/random-text",
 ]
 
-# Fewer Google properties - each extra domain is another chance to hit /sorry/
 GOOGLE_HOSTS = [
     "www.google.com", "www.google.com", "www.google.com", "www.google.com",
     "www.google.co.uk", "www.google.ca", "www.google.com.au",
@@ -156,10 +155,8 @@ QUERY_POOL: list[str] = []
 
 def build_query_pool(pages: list[str]) -> list[str]:
     pool = list(BRAND_QUERIES) + list(HEAD_QUERIES)
-
     slugs = []
     for p in pages:
-        # "/fonts/kaomoji-shrug" -> "fonts kaomoji shrug"
         slug = re.sub(r"[-/_]+", " ", p).strip().lower()
         slug = re.sub(r"\s+", " ", slug)
         if not slug or slug in ("about", "contact", "privacy policy", "terms"):
@@ -167,13 +164,11 @@ def build_query_pool(pages: list[str]) -> list[str]:
         if len(slug) < 4:
             continue
         slugs.append(slug)
-
     slugs = list(dict.fromkeys(slugs))
     random.shuffle(slugs)
     for slug in slugs[:40]:
         pool.append(slug)
         pool.append(f"{slug} generator")
-
     pool = list(dict.fromkeys(pool))
     log(f"[*] query pool: {len(pool)} queries "
         f"({len(BRAND_QUERIES)} brand, {len(HEAD_QUERIES)} head, "
@@ -220,6 +215,20 @@ def cdp_move(driver, x, y, steps=8):
         except Exception:
             break
         time.sleep(random.uniform(0.01, 0.04))
+
+
+def cdp_click(driver, x, y) -> bool:
+    try:
+        cdp_move(driver, x, y, steps=5)
+        time.sleep(0.15)
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent",
+            {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1})
+        time.sleep(0.09)
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent",
+            {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1})
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +417,6 @@ class ProxyPool:
         log(f"[*] proxies geolocated: {len(self.good)}")
 
     def next_alive(self, deadline: float, tries: int = 5):
-        """Pre-flight with a real request so Chrome never opens a dead proxy."""
         checked = 0
         while checked < tries and budget_left(deadline) > 0:
             cand = self.next()
@@ -537,43 +545,80 @@ def write_vpn_config(server: dict) -> str:
     return path
 
 
-def vpn_tail(n: int = 4) -> str:
+def vpn_tail(n: int = 5) -> str:
+    try:
+        size = os.path.getsize(VPN_LOG)
+    except Exception:
+        return "<no log file>"
+    if size == 0:
+        return "<log empty>"
     try:
         with open(VPN_LOG, "r", errors="ignore") as fh:
             lines = [ln for ln in fh.read().splitlines() if ln.strip()]
-        return " | ".join(lines[-n:])
-    except Exception:
-        return ""
+        return " | ".join(lines[-n:])[:400]
+    except Exception as e:
+        return f"<unreadable: {e}>"
 
 
 def start_vpn(server: dict):
     cfg = write_vpn_config(server)
     if os.path.exists(VPN_LOG):
         os.remove(VPN_LOG)
-    return subprocess.Popen(["sudo", "openvpn", "--config", cfg, "--log", VPN_LOG],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # we are already root inside the workflow (sudo -E python) - no nested sudo
+    cmd = [OPENVPN_BIN, "--config", cfg]
+    if not IS_ROOT:
+        cmd = ["sudo", "-n"] + cmd
+
+    logfh = open(VPN_LOG, "ab", buffering=0)
+    proc = subprocess.Popen(cmd, stdout=logfh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    proc._logfh = logfh
+    log(f"      cmd: {' '.join(cmd)} (root={IS_ROOT})")
+    return proc
+
+
+FATAL_MARKERS = (
+    "AUTH_FAILED",
+    "Exiting due to fatal error",
+    "Options error",
+    "Cannot open TUN",
+    "Cannot ioctl TUNSETIFF",
+    "Permission denied",
+    "SIGTERM",
+)
 
 
 def wait_for_tunnel(proc, deadline: float) -> bool:
+    first_bytes_logged = False
     while budget_left(deadline) > 0:
-        if proc.poll() is not None and proc.returncode != 0:
-            return False
+        if proc.poll() is not None:
+            if proc.returncode != 0:
+                return False
+
         try:
             with open(VPN_LOG, "r", errors="ignore") as fh:
                 txt = fh.read()
         except Exception:
-            time.sleep(0.8)
+            time.sleep(0.7)
             continue
+
+        if txt and not first_bytes_logged:
+            first_bytes_logged = True
+            log(f"      openvpn started writing ({len(txt)}B)")
+
         if "Initialization Sequence Completed" in txt:
             return True
-        if "AUTH_FAILED" in txt:
-            return False
-        time.sleep(0.8)
+
+        for m in FATAL_MARKERS:
+            if m in txt:
+                log(f"      openvpn fatal: {m}")
+                return False
+
+        time.sleep(0.7)
     return False
 
 
 def tunnel_has_egress(deadline: float) -> str | None:
-    """Confirm traffic actually flows through the tunnel."""
     end = min(time.time() + 12, deadline)
     while time.time() < end:
         try:
@@ -586,21 +631,33 @@ def tunnel_has_egress(deadline: float) -> str | None:
     return None
 
 
+def _kill_pid(pid: int) -> None:
+    try:
+        if IS_ROOT:
+            os.kill(pid, signal.SIGTERM)
+        else:
+            subprocess.run(["sudo", "-n", "kill", str(pid)], timeout=10)
+    except Exception:
+        pass
+
+
 def stop_vpn(proc) -> None:
     if not proc:
         return
-    try:
-        subprocess.run(["sudo", "kill", str(proc.pid)], timeout=10)
-    except Exception:
-        pass
+    _kill_pid(proc.pid)
     try:
         proc.terminate()
-        proc.wait(timeout=8)
+        proc.wait(timeout=6)
     except Exception:
         try:
             proc.kill()
         except Exception:
             pass
+    try:
+        if getattr(proc, "_logfh", None):
+            proc._logfh.close()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -903,8 +960,11 @@ def handle_google_consent(driver, deadline: float) -> bool:
 
 
 def _click_recaptcha(driver) -> bool:
-    """The checkbox lives INSIDE an iframe - must switch in."""
-    clicked = False
+    """Click the reCAPTCHA checkbox with REAL mouse events.
+
+    The checkbox lives inside an iframe, and reCAPTCHA ignores synthetic
+    JS clicks - both must be handled.
+    """
     try:
         frames = driver.find_elements(
             By.CSS_SELECTOR, 'iframe[src*="recaptcha"], iframe[title*="reCAPTCHA"]')
@@ -913,111 +973,170 @@ def _click_recaptcha(driver) -> bool:
 
     for f in frames:
         try:
+            frect = f.rect              # top-level viewport coords
+        except Exception:
+            continue
+        try:
             driver.switch_to.frame(f)
         except Exception:
             continue
+
+        clicked = False
         try:
             for sel in ("#recaptcha-anchor", ".recaptcha-checkbox-border",
                         ".recaptcha-checkbox", "span[role=checkbox]"):
                 for el in driver.find_elements(By.CSS_SELECTOR, sel):
                     try:
-                        if el.is_displayed():
-                            el.click()
+                        if not el.is_displayed():
+                            continue
+                        r = el.rect
+                        x = frect["x"] + r["x"] + r["width"] / 2
+                        y = frect["y"] + r["y"] + r["height"] / 2
+                        if cdp_click(driver, x, y):
                             clicked = True
                             break
                     except Exception:
                         continue
                 if clicked:
                     break
-        except Exception:
-            pass
         finally:
             try:
                 driver.switch_to.default_content()
             except Exception:
                 pass
+
         if clicked:
-            break
-    return clicked
+            return True
+    return False
+
+
+def _click_verify(driver) -> bool:
+    """If a challenge grid opened, hit the verify button (frame-aware)."""
+    try:
+        frames = driver.find_elements(By.CSS_SELECTOR, 'iframe[src*="bframe"], iframe[title*="challenge"]')
+    except Exception:
+        frames = []
+    for f in frames:
+        try:
+            frect = f.rect
+            driver.switch_to.frame(f)
+        except Exception:
+            continue
+        done = False
+        try:
+            for el in driver.find_elements(By.CSS_SELECTOR, "#recaptcha-verify-button"):
+                try:
+                    if el.is_displayed():
+                        r = el.rect
+                        x = frect["x"] + r["x"] + r["width"] / 2
+                        y = frect["y"] + r["y"] + r["height"] / 2
+                        done = cdp_click(driver, x, y)
+                        break
+                except Exception:
+                    continue
+        finally:
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+        if done:
+            return True
+    return False
+
+
+def _sorry_continue_target(driver) -> str | None:
+    try:
+        m = re.search(r"[?&]continue=([^&]+)", _url(driver))
+        if not m:
+            return None
+        t = unquote(unquote(m.group(1)))
+        return t if t.startswith("http") else None
+    except Exception:
+        return None
 
 
 def solve_sorry(driver, deadline: float) -> bool:
-    """Solve Google's /sorry/ abuse wall. Frame-aware, then re-target."""
+    """Solve Google's /sorry/ abuse wall."""
     if "/sorry/" not in _url(driver):
         return True
 
     log("    [!] google /sorry/ - solving captcha")
-    for attempt in range(3):
+    target = _sorry_continue_target(driver)
+
+    for attempt in range(4):
         if budget_left(deadline) <= 0:
             break
+
         if _click_recaptcha(driver):
-            log("    [.] captcha checkbox clicked")
-        time.sleep(2.5)
+            log(f"      captcha clicked (attempt {attempt + 1})")
 
+        # poll for the wall to clear
+        end = min(time.time() + 9, deadline)
+        while time.time() < end:
+            if "/sorry/" not in _url(driver):
+                log("    [+] /sorry/ cleared")
+                return True
+            time.sleep(0.7)
+
+        _click_verify(driver)
+        time.sleep(1.5)
         if "/sorry/" not in _url(driver):
-            log("    [+] /sorry/ cleared")
+            log("    [+] /sorry/ cleared after verify")
             return True
 
-        # a challenge grid may be showing - try the verify button
-        try:
-            for b in driver.find_elements(
-                    By.CSS_SELECTOR, "#recaptcha-verify-button, button"):
-                if b.is_displayed() and "verify" in (b.text or "").lower():
-                    b.click()
-                    time.sleep(2.0)
-                    break
-        except Exception:
-            pass
-
-        if "/sorry/" not in _url(driver):
-            log("    [+] /sorry/ cleared")
-            return True
-
-    # last resort: jump straight to the continue= target
-    try:
-        m = re.search(r"[?&]continue=([^&]+)", _url(driver))
-        if m:
-            target = unquote(unquote(m.group(1)))
-            if target.startswith("http"):
-                _fast_get(driver, target, cap=8)
-                if "/sorry/" not in _url(driver):
-                    log("    [+] /sorry/ bypassed via continue=")
-                    return True
-    except Exception:
-        pass
+        # early bypass: jump straight at the continue target
+        if attempt >= 1 and target:
+            _fast_get(driver, target, cap=8)
+            if "/sorry/" not in _url(driver):
+                log("    [+] /sorry/ bypassed via continue=")
+                return True
 
     return "/sorry/" not in _url(driver)
 
 
 def google_health_check(driver, deadline: float) -> bool:
     """Prove Google works from this route before spending the run on it."""
-    log("[*] google health check")
-    _fast_get(driver, "https://www.google.com/ncr", cap=8)
+    hc_deadline = min(deadline, time.time() + GOOGLE_HEALTH_SECONDS)
+    log(f"[*] google health check (budget {GOOGLE_HEALTH_SECONDS}s)")
 
-    if _is_error_page(driver):
-        log("    [!] google unreachable (error page)")
-        _fast_get(driver, "https://www.google.com/", cap=8)
+    for round_no in (1, 2):
+        if budget_left(hc_deadline) <= 0:
+            break
+
+        _fast_get(driver, "https://www.google.com/ncr", cap=8)
+
         if _is_error_page(driver):
-            log("    [!] google still unreachable")
-            return False
+            log(f"    [!] round {round_no}: google unreachable (error page)")
+            _fast_get(driver, "https://www.google.com/", cap=8)
+            if _is_error_page(driver):
+                if round_no == 1:
+                    time.sleep(2.0)
+                    continue
+                log("    [!] google unreachable after retry")
+                return False
 
-    if "/sorry/" in _url(driver):
-        solve_sorry(driver, deadline)
+        if "/sorry/" in _url(driver):
+            solve_sorry(driver, hc_deadline)
 
-    probe = f"https://www.google.com/search?q={quote('abdulsamad')}&hl=en&num=10"
-    _fast_get(driver, probe, cap=8)
-
-    if _is_error_page(driver):
-        log("    [!] search page failed to load")
-        return False
-
-    if "/sorry/" in _url(driver):
-        solve_sorry(driver, deadline)
+        probe = f"https://www.google.com/search?q={quote('abdulsamad')}&hl=en&num=10"
         _fast_get(driver, probe, cap=8)
 
-    ok = "/sorry/" not in _url(driver) and not _is_error_page(driver)
-    log(f"    [{' +' if ok else '!'}] google usable: {ok}")
-    return ok
+        if _is_error_page(driver):
+            log(f"    [!] round {round_no}: search page failed to load")
+            continue
+
+        if "/sorry/" in _url(driver):
+            solve_sorry(driver, hc_deadline)
+            _fast_get(driver, probe, cap=8)
+
+        ok = "/sorry/" not in _url(driver) and not _is_error_page(driver)
+        if ok:
+            log("    [+] google usable: True")
+            return True
+        log(f"    [!] round {round_no}: still walled")
+
+    log("    [!] google usable: False")
+    return False
 
 
 def _wait_for_serp(driver, deadline: float, timeout: float = 8.0) -> int:
@@ -1043,16 +1162,15 @@ def dump_serp(driver, tag: str) -> dict:
         info = js(driver, """
             const a = Array.from(document.querySelectorAll('a[href]'));
             return {
-              url: (location.href || '').slice(0, 90),
-              title: (document.title || '').slice(0, 50),
+              url: (location.href || '').slice(0, 80),
+              title: (document.title || '').slice(0, 40),
               anchors: a.length,
-              hasSearch: !!document.querySelector('#search'),
               textLen: document.body ? document.body.innerText.length : 0
             };
         """) or {}
     except Exception:
         pass
-    log(f"    [diag:{tag}] {json.dumps(info)[:260]}")
+    log(f"    [diag:{tag}] {json.dumps(info)[:240]}")
     return info
 
 
@@ -1104,7 +1222,6 @@ def viewport_scroll_to(driver, el) -> None:
 
 
 def impression_pass(driver, deadline: float, force_click: bool = False) -> dict:
-    """One Google query -> one potential impression."""
     result = {"query": None, "impression": False, "clicked": False,
               "ad_clicked": False, "loaded": False}
 
@@ -1383,7 +1500,6 @@ def main() -> int:
         vpn_countries |= {"JP", "KR"}
         log("[*] note: VPN_COUNTRIES missing JP/KR, auto-fixed")
 
-    # one profile per day -> the /sorry/ exemption cookie is reused all day
     ident_id = state.get("identity_id")
     if not ident_id:
         ident_id = random.randint(1, 5)
@@ -1409,7 +1525,8 @@ def main() -> int:
 
         if driver is None:
             vpn_deadline = time.time() + VPN_BUDGET
-            log(f"[*] tier 2: VPN Gate (budget {VPN_BUDGET}s, {VPN_TRY_TIMEOUT}s/attempt)")
+            log(f"[*] tier 2: VPN Gate (budget {VPN_BUDGET}s, {VPN_TRY_TIMEOUT}s/attempt, "
+                f"root={IS_ROOT}, bin={OPENVPN_BIN})")
             pool = fetch_vpngate(vpn_countries)
             for tries, server in enumerate(pick_vpn_candidates(pool, VPN_MAX_TRIES), 1):
                 if budget_left(vpn_deadline) <= 0:
@@ -1420,7 +1537,7 @@ def main() -> int:
                     f"{server['ip']} ping={server['ping']:.0f} sessions={server['sessions']}")
                 vpn_proc = start_vpn(server)
                 if not wait_for_tunnel(vpn_proc, attempt_deadline):
-                    log(f"    [!] vpn {server['cc']} no tunnel: {vpn_tail(3)}")
+                    log(f"    [!] vpn {server['cc']} no tunnel: {vpn_tail()}")
                     stop_vpn(vpn_proc)
                     vpn_proc = None
                     continue
@@ -1476,7 +1593,6 @@ def main() -> int:
         google_ok = google_health_check(driver, phase1_deadline)
         SUMMARY["google_ok"] = google_ok
 
-        # ================= PHASE 1: IMPRESSIONS =================
         if google_ok:
             log(f"[*] phase 1: impressions (target {TARGET_IMPRESSIONS})")
             fails = 0
@@ -1537,7 +1653,6 @@ def main() -> int:
             open_page(driver, "/", session_deadline)
             warmup(driver, session_deadline)
 
-        # ================= PHASE 2: TOP UP VIEWS/CLICKS =================
         log("[*] phase 2: top up views/clicks")
         tried_paths = list(pages)
         random.shuffle(tried_paths)
